@@ -1,0 +1,10 @@
+src/**
+node_modules/**
+.vscode-test/**
+out/test/**
+**/*.map
+tsconfig.json
+*.tmp*
+scripts/**
+*.vsix
+media/logo.svg

@@ -1,0 +1,8 @@
+target/
+node_modules/
+*.vsix
+out/
+.vscode-test/
+extension/bin/
+.env
+extension/LICENSE

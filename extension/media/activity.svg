@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- Activity Bar icon: VS Code draws it monochrome, so the two cursors
+       don't overlap (an outline wouldn't survive). -->
+  <defs>
+    <path id="c" d="M0 0 L0 46 L12 35 L21 55 L30 51 L21 31 L37 31 Z"/>
+  </defs>
+  <g fill="none" stroke="#C5C5C5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="5.5,7 1.5,12 5.5,17"/>
+    <polyline points="18.5,7 22.5,12 18.5,17"/>
+  </g>
+  <use href="#c" transform="translate(7.1 5.1) scale(0.15)" fill="#C5C5C5"/>
+  <use href="#c" transform="translate(11.9 10.7) scale(0.15)" fill="#C5C5C5"/>
+</svg>

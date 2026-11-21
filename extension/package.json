@@ -1,0 +1,206 @@
+{
+  "name": "ferroshare",
+  "displayName": "Ferroshare",
+  "description": "Self-hosted, end-to-end encrypted live share for VS Code: real-time collaboration through your own Rust relay, with the host's IntelliSense for guests.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other",
+    "Education"
+  ],
+  "keywords": [
+    "live share",
+    "collaboration",
+    "pair programming",
+    "real-time",
+    "co-editing",
+    "multiplayer",
+    "self-hosted",
+    "end-to-end encryption",
+    "crdt",
+    "remote",
+    "rust"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "main": "./out/extension.js",
+  "icon": "media/icon.png",
+  "activationEvents": [
+    "onStartupFinished",
+    "onFileSystem:mls"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "mls.menu",
+        "title": "Ferroshare: Menu"
+      },
+      {
+        "command": "mls.host",
+        "title": "Ferroshare: Host Session",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "mls.join",
+        "title": "Ferroshare: Join Session",
+        "icon": "$(link)"
+      },
+      {
+        "command": "mls.copyInvite",
+        "title": "Ferroshare: Copy Invite Link",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "mls.goToParticipant",
+        "title": "Ferroshare: Go to Participant"
+      },
+      {
+        "command": "mls.leave",
+        "title": "Ferroshare: End / Leave Session",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "mls.undo",
+        "title": "Ferroshare: Undo (own edits only)"
+      },
+      {
+        "command": "mls.redo",
+        "title": "Ferroshare: Redo (own edits only)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "mls.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "editorTextFocus && !editorReadonly && mls.inSharedDoc"
+      },
+      {
+        "command": "mls.redo",
+        "key": "ctrl+y",
+        "mac": "cmd+shift+z",
+        "when": "editorTextFocus && !editorReadonly && mls.inSharedDoc"
+      },
+      {
+        "command": "mls.redo",
+        "key": "ctrl+shift+z",
+        "when": "editorTextFocus && !editorReadonly && mls.inSharedDoc"
+      }
+    ],
+    "configuration": {
+      "title": "Ferroshare",
+      "properties": {
+        "ferroshare.relayUrl": {
+          "type": "string",
+          "default": "ws://localhost:7777",
+          "description": "Relay to host sessions on. Must be reachable by your guests, e.g. ws://your-public-ip:7777 or wss://relay.example.com."
+        },
+        "ferroshare.displayName": {
+          "type": "string",
+          "default": "",
+          "description": "Name shown to other participants (defaults to your OS user name)."
+        },
+        "ferroshare.daemonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the mls daemon executable (defaults to the bundled one)."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ferroshare",
+          "title": "Ferroshare",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "ferroshare": [
+        {
+          "id": "mls.session",
+          "name": "Session"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "mls.session",
+        "when": "!mls.active",
+        "contents": "Collaborate in real time. Guests get your IntelliSense, and everything is end-to-end encrypted.\n[$(broadcast) Host Session](command:mls.host)\n[$(link) Join Session](command:mls.join)\nHosting uses the relay in [settings](command:workbench.action.openSettings?%5B%22ferroshare.relayUrl%22%5D)."
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "mls.copyInvite",
+          "when": "view == mls.session && mls.isHost",
+          "group": "navigation@1"
+        },
+        {
+          "command": "mls.leave",
+          "when": "view == mls.session && mls.active",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "mls.copyInvite",
+          "when": "mls.isHost"
+        },
+        {
+          "command": "mls.goToParticipant",
+          "when": "mls.active"
+        },
+        {
+          "command": "mls.leave",
+          "when": "mls.active"
+        },
+        {
+          "command": "mls.undo",
+          "when": "false"
+        },
+        {
+          "command": "mls.redo",
+          "when": "false"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=out/extension.js --sourcemap",
+    "watch": "npm run build -- --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test src/*.test.ts",
+    "build:test": "esbuild src/test/suite.ts src/test/suiteGuest.ts --bundle --platform=node --format=cjs --external:vscode --outdir=out/test --sourcemap",
+    "test:vscode": "npm run build && npm run build:test && node src/test/runTest.ts",
+    "icon": "node scripts/icon.mjs",
+    "package": "npm run build && node scripts/package.mjs"
+  },
+  "dependencies": {
+    "yjs": "^13.6.33"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/node": "^26.6.6",
+    "@types/vscode": "^1.95.0",
+    "@vscode/test-electron": "^3.1.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asger118/ferroshare.git"
+  },
+  "homepage": "https://github.com/asger118/ferroshare#readme",
+  "bugs": {
+    "url": "https://github.com/asger118/ferroshare/issues"
+  }
+}

@@ -1,0 +1,29 @@
+# Relay only, exposed on port 7777 (port forwarding or a VPS):
+#   docker compose up -d relay
+#
+# Relay behind a Cloudflare Tunnel (no open ports; e.g. wss://relay.example.com):
+#   1. Cloudflare dashboard → Zero Trust → Networks → Tunnels → Create a tunnel
+#      (Cloudflared) → copy the token from the "docker run" command.
+#   2. Add a public hostname: relay.example.com → type HTTP, URL relay:7777
+#   3. Put TUNNEL_TOKEN=<token> in a .env file next to this one, then:
+#      docker compose --profile tunnel up -d
+
+services:
+  relay:
+    image: asgerveng/ferroshare-relay:latest # pulled from Docker Hub; `docker compose build` builds it from source instead
+    build: .
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info
+    #ports:
+    #  - "7777:7777" # remove when using the tunnel, so the relay is only reachable through Cloudflare
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      - relay
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    command: tunnel --no-autoupdate run
+    profiles: [ tunnel ]

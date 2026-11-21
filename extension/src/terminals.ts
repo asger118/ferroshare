@@ -13,6 +13,7 @@ const CURSOR_REPORT = /\x1b\[\d+;\d+R/g;
 
 export interface TerminalPort {
   input(id: number, data: string): void;
+  /** My tab's size (0×0: I closed it). The shell follows the smallest tab. */
   resize(id: number, cols: number, rows: number): void;
   /** Host: kill the shell. */
   close(id: number): void;
@@ -28,6 +29,8 @@ export class SharedTerminal implements vscode.Pseudoterminal {
   private terminal: vscode.Terminal | undefined;
   private warnedReadOnly = false;
   private exited = false;
+  /** The shell's size: the smallest tab anyone has open. */
+  size: { cols: number; rows: number } | undefined;
   readonly id: number;
   readonly name: string;
   readonly writable: boolean;
@@ -80,7 +83,9 @@ export class SharedTerminal implements vscode.Pseudoterminal {
     // The user closed the tab. The host's shell dies with it; a guest can reopen it.
     this.terminal = undefined;
     this.opened = false;
-    if (this.isHost && !this.exited) this.port.close(this.id);
+    if (this.exited) return;
+    if (this.isHost) this.port.close(this.id);
+    else this.port.resize(this.id, 0, 0);
   }
 
   handleInput(data: string): void {
@@ -100,8 +105,7 @@ export class SharedTerminal implements vscode.Pseudoterminal {
   }
 
   setDimensions(dims: vscode.TerminalDimensions): void {
-    // The host's terminal decides the size; guests' tabs just wrap.
-    if (this.isHost) this.port.resize(this.id, dims.columns, dims.rows);
+    if (!this.exited) this.port.resize(this.id, dims.columns, dims.rows);
   }
 
   // ------------------------------------------------------- from the daemon

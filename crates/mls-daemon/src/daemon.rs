@@ -21,6 +21,10 @@ pub const SYNC_EVERY: Duration = Duration::from_secs(3);
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Host: if the editor doesn't hand over a buffer in time, seed from disk.
 const SEED_TIMEOUT: Duration = Duration::from_secs(5);
+/// A shared terminal is never made smaller than this, whatever tab sizes
+/// people report.
+const MIN_COLS: u16 = 20;
+const MIN_ROWS: u16 = 5;
 
 /// Yjs/yrs encode an update containing nothing as two zero bytes.
 fn is_empty_update(u: &[u8]) -> bool {
@@ -43,6 +47,26 @@ struct Terminal {
     writable: bool,
     scrollback: Vec<u8>,
     pty: Option<Pty>,
+    /// Current size of the shell.
+    size: (u16, u16),
+    /// Host: the size of each participant's open tab. The shell gets the
+    /// smallest, so output fits everyone's tab without wrapping.
+    views: BTreeMap<PeerId, (u16, u16)>,
+    /// Guest: the size of my tab, re-sent after a reconnect.
+    mine: Option<(u16, u16)>,
+}
+
+impl Terminal {
+    fn new(name: String, writable: bool, pty: Option<Pty>) -> Self {
+        Self { name, writable, scrollback: Vec::new(), pty, size: (80, 24), views: BTreeMap::new(), mine: None }
+    }
+}
+
+/// The smallest tab anyone has open (`None`: nobody has one open).
+fn view_size(views: &BTreeMap<PeerId, (u16, u16)>) -> Option<(u16, u16)> {
+    let cols = views.values().map(|v| v.0).min()?;
+    let rows = views.values().map(|v| v.1).min()?;
+    Some((cols.max(MIN_COLS), rows.max(MIN_ROWS)))
 }
 
 #[derive(Default)]
@@ -50,6 +74,7 @@ struct FsChanges {
     created: Vec<String>,
     changed: Vec<String>,
     removed: Vec<String>,
+    renamed: Vec<(String, String)>,
 }
 
 impl FsChanges {
@@ -60,10 +85,7 @@ impl FsChanges {
             FsOp::Write { path, .. } => c.changed.push(path.clone()),
             FsOp::CreateDir(path) => c.created.push(path.clone()),
             FsOp::Delete { path, .. } => c.removed.push(path.clone()),
-            FsOp::Rename { from, to, .. } => {
-                c.removed.push(from.clone());
-                c.created.push(to.clone());
-            }
+            FsOp::Rename { from, to, .. } => c.renamed.push((from.clone(), to.clone())),
             FsOp::ReadDir(_) | FsOp::Stat(_) | FsOp::Read(_) => {}
         }
         c
@@ -73,6 +95,11 @@ impl FsChanges {
 /// `path` is `prefix` or inside it.
 fn is_under(path: &str, prefix: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Where `path` ends up when `from` is renamed to `to`.
+fn moved(path: &str, from: &str, to: &str) -> Option<String> {
+    is_under(path, from).then(|| format!("{to}{}", &path[from.len()..]))
 }
 
 struct Seeding {
@@ -250,6 +277,7 @@ impl Daemon {
         }
         for (&id, t) in &self.terminals {
             self.emit(CtlOut::TermOpened { id, name: t.name.clone(), writable: t.writable });
+            self.emit(CtlOut::TermSize { id, cols: t.size.0, rows: t.size.1 });
             if !t.scrollback.is_empty() {
                 self.emit(CtlOut::TermOutput { id, data: B64(t.scrollback.clone()) });
             }
@@ -315,9 +343,9 @@ impl Daemon {
                     }
                 }
             }
-            CtlIn::FsNotify { created, changed, removed } => {
+            CtlIn::FsNotify { created, changed, removed, renamed } => {
                 if self.is_host() {
-                    self.fs_changed(FsChanges { created, changed, removed });
+                    self.fs_changed(FsChanges { created, changed, removed, renamed });
                 }
             }
             CtlIn::TermOpen { name, shell, writable } => {
@@ -335,8 +363,11 @@ impl Daemon {
                 }
             }
             CtlIn::TermResize { id, cols, rows } => {
-                if let Some(pty) = self.terminals.get(&id).and_then(|t| t.pty.as_ref()) {
-                    pty.resize(cols, rows);
+                if self.is_host() {
+                    self.set_view(id, self.me, cols, rows);
+                } else if let Some(t) = self.terminals.get_mut(&id) {
+                    t.mine = (cols > 0 && rows > 0).then_some((cols, rows));
+                    self.to_host(&AppMsg::TermResize { id, cols, rows });
                 }
             }
             CtlIn::TermClose { id } => {
@@ -419,14 +450,52 @@ impl Daemon {
     /// Files appeared, changed or went away: drop shared documents that no
     /// longer exist and tell everyone, so explorers update right away.
     fn fs_changed(&mut self, c: FsChanges) {
-        if c.created.is_empty() && c.changed.is_empty() && c.removed.is_empty() {
+        if c.created.is_empty() && c.changed.is_empty() && c.removed.is_empty() && c.renamed.is_empty() {
             return;
         }
+        let moved = self.rename_docs(&c.renamed);
         self.drop_docs_under(&c.removed);
-        self.emit(CtlOut::FsChanged { created: c.created.clone(), changed: c.changed.clone(), removed: c.removed.clone() });
-        if self.is_host() {
-            self.send(None, &AppMsg::FsChanged { created: c.created, changed: c.changed, removed: c.removed });
+        self.emit(CtlOut::FsChanged {
+            created: c.created.clone(),
+            changed: c.changed.clone(),
+            removed: c.removed.clone(),
+            renamed: c.renamed.clone(),
+        });
+        // After FsChanged, so the extension has dropped the old bindings.
+        for path in moved {
+            if let Ok(state) = self.store.full_state(&path) {
+                self.emit(CtlOut::DocState { path, update: B64(state) });
+            }
         }
+        if self.is_host() {
+            // Peers from before `renamed` see a rename as a delete and a create.
+            let (mut created, mut removed) = (c.created, c.removed);
+            for (from, to) in &c.renamed {
+                removed.push(from.clone());
+                created.push(to.clone());
+            }
+            self.send(None, &AppMsg::FsChanged { created, changed: c.changed, removed, renamed: c.renamed });
+        }
+    }
+
+    /// Shared documents below a renamed path keep their content, history and
+    /// collaborators under the new name. Returns the new paths.
+    fn rename_docs(&mut self, renamed: &[(String, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (from, to) in renamed {
+            let docs: Vec<(String, String)> =
+                self.store.paths().filter_map(|p| moved(p, from, to).map(|n| (p.to_string(), n))).collect();
+            for (old, new) in docs {
+                debug!(old, new, "shared document renamed");
+                self.store.rename(&old, &new);
+                out.push(new);
+            }
+            self.requested = std::mem::take(&mut self.requested)
+                .into_iter()
+                .map(|p| moved(&p, from, to).unwrap_or(p))
+                .collect();
+        }
+        out
     }
 
     fn drop_docs_under(&mut self, removed: &[String]) {
@@ -448,7 +517,7 @@ impl Daemon {
             Ok(pty) => {
                 self.next_term += 1;
                 info!(id, name, writable, "terminal shared");
-                self.terminals.insert(id, Terminal { name: name.clone(), writable, scrollback: Vec::new(), pty: Some(pty) });
+                self.terminals.insert(id, Terminal::new(name.clone(), writable, Some(pty)));
                 self.emit(CtlOut::TermOpened { id, name: name.clone(), writable });
                 self.send(None, &AppMsg::TermOpened { id, name, writable });
             }
@@ -476,10 +545,39 @@ impl Daemon {
         }
     }
 
+    /// Host: someone's tab for terminal `id` changed size (0×0: they closed
+    /// it). The shell follows the smallest open tab.
+    fn set_view(&mut self, id: u32, peer: PeerId, cols: u16, rows: u16) {
+        let Some(t) = self.terminals.get_mut(&id) else { return };
+        if cols == 0 || rows == 0 {
+            t.views.remove(&peer);
+        } else {
+            t.views.insert(peer, (cols, rows));
+        }
+        self.apply_size(id);
+    }
+
+    fn apply_size(&mut self, id: u32) {
+        let Some(t) = self.terminals.get_mut(&id) else { return };
+        // Nobody has it open: keep the last size rather than guess.
+        let Some(size) = view_size(&t.views) else { return };
+        if size == t.size {
+            return;
+        }
+        t.size = size;
+        if let Some(pty) = &t.pty {
+            pty.resize(size.0, size.1);
+        }
+        debug!(id, cols = size.0, rows = size.1, "terminal resized");
+        self.emit(CtlOut::TermSize { id, cols: size.0, rows: size.1 });
+        self.send(None, &AppMsg::TermSize { id, cols: size.0, rows: size.1 });
+    }
+
     /// Host: bring a newly joined guest up to date with the open terminals.
     fn replay_terminals(&self, to: PeerId) {
         for (&id, t) in &self.terminals {
             self.send(Some(to), &AppMsg::TermOpened { id, name: t.name.clone(), writable: t.writable });
+            self.send(Some(to), &AppMsg::TermSize { id, cols: t.size.0, rows: t.size.1 });
             if !t.scrollback.is_empty() {
                 self.send(Some(to), &AppMsg::TermOutput { id, data: Bytes(t.scrollback.clone()) });
             }
@@ -581,6 +679,12 @@ impl Daemon {
             }
             RelayMsg::PeerLeft(id) => {
                 self.peers.remove(&id);
+                if self.is_host() {
+                    let terms: Vec<u32> = self.terminals.keys().copied().collect();
+                    for t in terms {
+                        self.set_view(t, id, 0, 0);
+                    }
+                }
                 self.emit(CtlOut::PeerLeft { id });
             }
             RelayMsg::SessionEnded => {
@@ -682,13 +786,34 @@ impl Daemon {
                 self.emit(CtlOut::LangResponse { id, ok, err });
             }
             AppMsg::Diagnostics { path, json } if from_host => self.emit(CtlOut::Diagnostics { path, json }),
-            AppMsg::FsChanged { created, changed, removed } if from_host => {
-                self.fs_changed(FsChanges { created, changed, removed })
+            AppMsg::FsChanged { mut created, changed, mut removed, renamed } if from_host => {
+                // Renames are also listed as removed + created (for older peers).
+                removed.retain(|p| !renamed.iter().any(|(from, _)| from == p));
+                created.retain(|p| !renamed.iter().any(|(_, to)| to == p));
+                self.fs_changed(FsChanges { created, changed, removed, renamed })
             }
             AppMsg::TermOpened { id, name, writable } if from_host => {
-                // Also sent again after a reconnect: start over with the replay.
-                self.terminals.insert(id, Terminal { name: name.clone(), writable, scrollback: Vec::new(), pty: None });
+                // Also sent again after a reconnect: start over with the
+                // replay, and tell the host my tab's size again.
+                let mine = self.terminals.get(&id).and_then(|t| t.mine);
+                let mut t = Terminal::new(name.clone(), writable, None);
+                t.mine = mine;
+                self.terminals.insert(id, t);
                 self.emit(CtlOut::TermOpened { id, name, writable });
+                if let Some((cols, rows)) = mine {
+                    self.to_host(&AppMsg::TermResize { id, cols, rows });
+                }
+            }
+            AppMsg::TermResize { id, cols, rows } if host => {
+                if self.peers.contains_key(&from) {
+                    self.set_view(id, from, cols, rows);
+                }
+            }
+            AppMsg::TermSize { id, cols, rows } if from_host => {
+                if let Some(t) = self.terminals.get_mut(&id) {
+                    t.size = (cols, rows);
+                    self.emit(CtlOut::TermSize { id, cols, rows });
+                }
             }
             AppMsg::TermOutput { id, data } if from_host => self.on_term_output(id, data.0),
             AppMsg::TermClosed { id, code } if from_host => self.close_terminal(id, code),

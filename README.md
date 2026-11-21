@@ -55,12 +55,12 @@ Mac or ARM Linux users can build the daemon themselves with `cargo build --relea
 - **Host:** set `ferroshare.relayUrl` to your relay's address. Open your project, click **Ferroshare** in the status bar and choose **Host session**. The invite link is copied to your clipboard.
 - **Guest:** click **Ferroshare**, choose **Join session** and paste the link. A window opens with the host's project.
 - **Status bar menu:** copy the invite, share a terminal, jump to a participant's cursor, end or leave the session.
-- **Files:** guests can create, delete, rename and move files and folders from their explorer. The host's VS Code carries each change out, so the host's open editors and unsaved changes move along with a rename, and deletes go to the host's trash.
+- **Files:** guests can create, delete, rename and move files and folders from their explorer. The host's VS Code carries each change out, and deletes go to the host's trash. When anyone renames or moves a file, everyone's open tabs move with it, unsaved changes included, and editing carries on under the new name.
 - **Shared terminals (host only):** **Share Terminal** starts a shell on the host machine in the shared folder, and it opens for everyone. The host picks:
   - **Read-only:** guests see the output but can't type.
   - **Read/write:** guests can type too, so **they can run any command on the host's computer, as the host**. Only do this with people you trust.
 
-  Closing the tab on the host stops the terminal for everyone. Guests can close theirs and reopen it from the Ferroshare panel. People who join later see the recent output.
+  The shell is sized to fit the smallest terminal panel anyone has open, so output never wraps for anyone. People with bigger panels see some empty space. Closing the tab on the host stops the terminal for everyone. Guests can close theirs and reopen it from the Ferroshare panel. People who join later see the recent output.
 
 ## Architecture
 
@@ -122,8 +122,7 @@ npm run test:vscode                    # real VS Code: one run as host, one run 
 
 - **Not built yet:** port forwarding, shared debugging and code actions (quick fixes).
 - **Changes made outside VS Code** on the host (e.g. `git checkout`, a build writing files) reach guests' explorers within about 5 seconds rather than instantly.
-- **Renames by someone else:** if another participant renames a file you have open, your tab shows it as deleted. Reopen it under the new name.
-- **Terminal size:** a shared terminal has the host's size. Guests with a narrower panel see full-screen programs (`vim`, `htop`) wrapped.
+- **Terminal size:** one person with a small terminal panel makes the shared shell small for everyone, until they make it bigger or close their tab.
 - **Duplicate results:** if a guest has their own extension for a language (TS/JS is built into VS Code), they see its results alongside the host's.
 - **Host disconnects end the session.** If the host's connection to the relay drops, the session ends. Guests reconnect automatically and nothing they typed is lost.
 - **What guests can read:** guests can read any file inside the shared folder except `.git/`. `.gitignore`d files are hidden from the explorer, but they can still be opened by exact path. Only share folders you're happy for your friends to see.

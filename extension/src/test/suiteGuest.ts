@@ -115,5 +115,30 @@ export async function run(): Promise<void> {
   assert.ok(!fs.existsSync(onDisk("docs")));
   log("file changes ok");
 
+  // Someone else renames a file I have open with unsaved changes: my tab
+  // moves to the new name, keeps the changes, and stays shared.
+  const utilUri = vscode.Uri.joinPath(root, "src", "util.ts");
+  const utilEditor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(utilUri));
+  await utilEditor.edit((e) => e.insert(new vscode.Position(0, 0), "// unsaved guest edit\n"));
+  assert.ok(utilEditor.document.isDirty);
+  await new Promise((r) => setTimeout(r, 500)); // let the edit reach the host
+  fs.writeFileSync(`${ws}.rename`, "src/util.ts\nsrc/helpers.ts");
+  const helpersUri = vscode.Uri.joinPath(root, "src", "helpers.ts");
+  const tabUris = () =>
+    vscode.window.tabGroups.all.flatMap((g) => g.tabs).flatMap((t) => (t.input instanceof vscode.TabInputText ? [t.input.uri.toString()] : []));
+  await until("my tab follows the rename", () => tabUris().includes(helpersUri.toString()) && !tabUris().includes(utilUri.toString()));
+  // The tab can show up a moment before its document does.
+  const helpers = await until("moved document keeps the unsaved edit", () =>
+    vscode.workspace.textDocuments.find((d) => d.uri.toString() === helpersUri.toString() && d.getText().startsWith("// unsaved guest edit\n")),
+  );
+  await vscode.window.showTextDocument(helpers);
+  await vscode.window.activeTextEditor!.edit((e) => e.insert(new vscode.Position(0, 0), "// after rename\n"));
+  await helpers.save();
+  await until("saved under the new name on the host", () =>
+    fs.readFileSync(onDisk("src/helpers.ts"), "utf8").startsWith("// after rename\n// unsaved guest edit\n"),
+  );
+  assert.ok(!fs.existsSync(onDisk("src/util.ts")));
+  log("tab follows someone else's rename ok");
+
   log("ALL GUEST CHECKS PASSED");
 }

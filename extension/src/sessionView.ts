@@ -78,7 +78,8 @@ export class SessionView implements vscode.TreeDataProvider<Node> {
         const item = new vscode.TreeItem(t?.name ?? "terminal");
         item.description = t?.writable ? "shared terminal" : "shared terminal · read-only";
         item.iconPath = new vscode.ThemeIcon(t?.writable ? "terminal" : "eye");
-        item.tooltip = s.role === "Host" ? "Click to show. Closing the tab stops it for everyone." : "Click to show.";
+        const size = t?.size ? `\nSize ${t.size.cols}×${t.size.rows}: it fits the smallest tab anyone has open.` : "";
+        item.tooltip = (s.role === "Host" ? "Click to show. Closing the tab stops it for everyone." : "Click to show.") + size;
         item.command = { command: "mls.showTerminal", title: "Show terminal", arguments: [node.id] };
         return item;
       }

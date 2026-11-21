@@ -34,6 +34,16 @@ export class FakeHost {
     this.client = client;
     this.root = root;
     client.on("message", (m: Msg) => this.onMessage(m));
+    // The guest suite (another process) asks for a rename on the host by
+    // writing "from\nto" to <workspace>.rename.
+    const request = `${root}.rename`;
+    setInterval(() => {
+      if (!fs.existsSync(request)) return;
+      const [from, to] = fs.readFileSync(request, "utf8").split("\n");
+      fs.rmSync(request);
+      this.applyFs({ rename: { from, to } });
+      this.client.send({ t: "fsNotify", renamed: [[from, to]] });
+    }, 100).unref();
   }
 
   private onMessage(m: Msg): void {
@@ -72,6 +82,17 @@ export class FakeHost {
       }
       case "update":
         this.docs.get(m.path)?.b.applyRemote(Buffer.from(m.update, "base64"));
+        break;
+      case "fsChanged":
+        // Renamed documents come back as a docState under the new name.
+        for (const [from] of m.renamed) {
+          for (const [p, d] of [...this.docs]) {
+            if (p === from || p.startsWith(from + "/")) {
+              d.b.destroy();
+              this.docs.delete(p);
+            }
+          }
+        }
         break;
       case "save": {
         const d = this.docs.get(m.path);

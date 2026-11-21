@@ -314,7 +314,10 @@ async fn guest_changes_files_through_the_host_editor() {
     gx.send(json!({"t": "open", "path": "src/a.txt"})).await;
     hx.expect("readDoc").await;
     hx.send(json!({"t": "docText", "path": "src/a.txt", "text": null})).await;
-    gx.expect("docState").await;
+    let st = hx.expect("docState").await;
+    hx.apply(&st);
+    let st = gx.expect("docState").await;
+    gx.apply(&st);
 
     // Create a file: the host editor is asked to do it, then everyone hears about it.
     gx.send(json!({"t": "fs", "id": 1, "op": {"write": {"path": "new.txt", "data": "aGk=", "create": true, "overwrite": false}}})).await;
@@ -341,19 +344,35 @@ async fn guest_changes_files_through_the_host_editor() {
     hx.send(json!({"t": "fsApplied", "id": apply["id"], "err": "NoPermissions: read-only disk"})).await;
     assert_eq!(gx.expect("fsResult").await["err"], "NoPermissions: read-only disk");
 
-    // Rename the open document: it's dropped everywhere, so the new name is
-    // seeded fresh from the host editor (which moved the buffer).
-    gx.send(json!({"t": "fs", "id": 5, "op": {"rename": {"from": "src/a.txt", "to": "src/b.txt", "overwrite": false}}})).await;
+    // Rename the open document (by moving its folder): it lives on under the
+    // new name for everyone, with its content, and editing carries on.
+    gx.send(json!({"t": "fs", "id": 5, "op": {"rename": {"from": "src", "to": "lib", "overwrite": false}}})).await;
     let apply = hx.expect("fsApply").await;
-    std::fs::rename(dir.path().join("src/a.txt"), dir.path().join("src/b.txt")).unwrap();
+    std::fs::rename(dir.path().join("src"), dir.path().join("lib")).unwrap();
     hx.send(json!({"t": "fsApplied", "id": apply["id"], "err": null})).await;
     gx.expect("fsResult").await;
-    let ch = gx.expect("fsChanged").await;
-    assert_eq!((ch["removed"].clone(), ch["created"].clone()), (json!(["src/a.txt"]), json!(["src/b.txt"])));
+    for x in [&mut gx, &mut hx] {
+        let ch = x.expect("fsChanged").await;
+        assert_eq!(ch["renamed"], json!([["src", "lib"]]));
+        assert_eq!((ch["removed"].clone(), ch["created"].clone()), (json!([]), json!([])), "a rename is not a delete");
+        let st = x.expect("docState").await;
+        assert_eq!(st["path"], "lib/a.txt");
+        x.apply(&st);
+        assert_eq!(x.docs.text("lib/a.txt").unwrap(), "hello\n");
+    }
+    gx.edit("lib/a.txt", 0, 0, "oh ").await;
+    let u = hx.expect("update").await;
+    assert_eq!(u["path"], "lib/a.txt");
+    hx.apply(&u);
+    assert_eq!(hx.docs.text("lib/a.txt").unwrap(), "oh hello\n");
     gx.send(json!({"t": "open", "path": "src/a.txt"})).await;
     assert_eq!(gx.expect("openFailed").await["path"], "src/a.txt");
-    gx.send(json!({"t": "open", "path": "src/b.txt"})).await;
-    assert_eq!(hx.expect("readDoc").await["path"], "src/b.txt");
+
+    // A rename on the host itself works the same way.
+    std::fs::rename(dir.path().join("lib/a.txt"), dir.path().join("lib/c.txt")).unwrap();
+    hx.send(json!({"t": "fsNotify", "renamed": [["lib/a.txt", "lib/c.txt"]]})).await;
+    assert_eq!(gx.expect("fsChanged").await["renamed"], json!([["lib/a.txt", "lib/c.txt"]]));
+    assert_eq!(gx.expect("docState").await["path"], "lib/c.txt");
 
     // Changes the host makes itself reach guests as well.
     hx.send(json!({"t": "fsNotify", "removed": ["new.txt"]})).await;
@@ -395,6 +414,26 @@ async fn host_shares_terminals() {
     let (_, line) = shell_and_sum(16);
     gx.send(json!({"t": "termInput", "id": rw, "data": line})).await;
     gx.expect_output(rw, "56").await;
+
+    // The shell is sized to the smallest open tab, so nobody's view wraps...
+    hx.send(json!({"t": "termResize", "id": rw, "cols": 120, "rows": 40})).await;
+    let s = gx.expect("termSize").await;
+    assert_eq!((s["id"].as_u64(), s["cols"].as_u64(), s["rows"].as_u64()), (Some(rw), Some(120), Some(40)));
+    assert_eq!(hx.expect("termSize").await["cols"].as_u64(), Some(120));
+    gx.send(json!({"t": "termResize", "id": rw, "cols": 70, "rows": 50})).await;
+    let s = hx.expect("termSize").await;
+    assert_eq!((s["cols"].as_u64(), s["rows"].as_u64()), (Some(70), Some(40)));
+    let probe = if cfg!(windows) { "mode con\r\n" } else { "stty size\n" };
+    gx.send(json!({"t": "termInput", "id": rw, "data": probe})).await;
+    gx.expect_output(rw, if cfg!(windows) { "70" } else { "40 70" }).await;
+    // ...and grows back when that tab closes.
+    gx.send(json!({"t": "termResize", "id": rw, "cols": 0, "rows": 0})).await;
+    let s = hx.expect("termSize").await;
+    assert_eq!((s["cols"].as_u64(), s["rows"].as_u64()), (Some(120), Some(40)));
+    // A guest can't shrink it to nothing.
+    gx.send(json!({"t": "termResize", "id": rw, "cols": 1, "rows": 1})).await;
+    let s = hx.expect("termSize").await;
+    assert_eq!((s["cols"].as_u64(), s["rows"].as_u64()), (Some(20), Some(5)));
 
     // Someone joining later gets the open terminals with their history.
     let late = start_daemon(mls::Mode::Join { invite: host.invite.clone() }, "late").await;

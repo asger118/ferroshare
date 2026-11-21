@@ -205,7 +205,16 @@ pub enum AppMsg {
 
     /// Host: files or folders were created, changed or removed (by a guest
     /// or on the host). Shared documents at or below a removed path are gone.
-    FsChanged { created: Vec<String>, changed: Vec<String>, removed: Vec<String> },
+    /// A rename is listed in `renamed`, and also as removed and created for
+    /// older peers. Shared documents below a renamed path live on under the
+    /// new name.
+    FsChanged {
+        created: Vec<String>,
+        changed: Vec<String>,
+        removed: Vec<String>,
+        #[serde(default)]
+        renamed: Vec<(String, String)>,
+    },
 
     /// Host started sharing a terminal. `writable`: guests may type in it.
     TermOpened { id: u32, name: String, writable: bool },
@@ -215,6 +224,11 @@ pub enum AppMsg {
     TermInput { id: u32, data: Bytes },
     /// The terminal's process exited or the host closed it.
     TermClosed { id: u32, code: Option<u32> },
+    /// Guest: the size of my tab for terminal `id` (0×0 = I closed it). The
+    /// host sizes the shell to the smallest open tab, so nobody's view wraps.
+    TermResize { id: u32, cols: u16, rows: u16 },
+    /// Host: the shell's current size.
+    TermSize { id: u32, cols: u16, rows: u16 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -266,5 +280,17 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(json, r#"{"write":{"path":"a","data":"AQI=","create":true,"overwrite":false}}"#);
         assert_eq!(serde_json::from_str::<FsOp>(&json).unwrap(), op);
+    }
+
+    /// Peers from before `renamed` existed must still be understood.
+    #[test]
+    fn fs_changed_without_renamed_decodes() {
+        #[derive(Serialize)]
+        enum Old {
+            FsChanged { created: Vec<String>, changed: Vec<String>, removed: Vec<String> },
+        }
+        let old = encode(&Old::FsChanged { created: vec!["a".into()], changed: vec![], removed: vec![] }).unwrap();
+        let m = decode::<AppMsg>(&old).unwrap();
+        assert_eq!(m, AppMsg::FsChanged { created: vec!["a".into()], changed: vec![], removed: vec![], renamed: vec![] });
     }
 }

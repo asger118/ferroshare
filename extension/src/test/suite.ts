@@ -242,15 +242,38 @@ export async function run(): Promise<void> {
     );
     const before = g.msgs.length;
     await ok({ rename: { from: "src/util.ts", to: "src/helpers.ts", overwrite: false } });
-    const moved = await until("host buffer moved", () => vscode.workspace.textDocuments.find((d) => d.uri.toString() === vscode.Uri.file(onDisk("src/helpers.ts")).toString()));
+    const hostDoc = (p: string) => vscode.workspace.textDocuments.find((d) => d.uri.toString() === vscode.Uri.file(onDisk(p)).toString());
+    const moved = await until("host buffer moved", () => hostDoc("src/helpers.ts"));
     assert.ok(moved.getText().startsWith("// unsaved guest line"), "unsaved edits follow the rename");
     assert.ok(moved.isDirty);
-    await until("guest told util.ts is gone", () => g.msgs.slice(before).find((m) => m.t === "fsChanged" && m.removed.includes("src/util.ts")));
-    g.docs.delete("src/util.ts");
+    // The shared document lives on under the new name: no reopening needed.
+    await until("guest told util.ts was renamed", () =>
+      g.msgs.slice(before).find((m) => m.t === "fsChanged" && JSON.stringify(m.renamed) === '[["src/util.ts","src/helpers.ts"]]'),
+    );
     gu.b.destroy();
-    g.client.send({ t: "open", path: "src/helpers.ts" });
-    await until("guest reopens under the new name", () => g.docs.get("src/helpers.ts")?.text.startsWith("// unsaved guest line"));
+    g.docs.delete("src/util.ts");
+    await until("guest has it under the new name", () => g.docs.get("src/helpers.ts")?.text.startsWith("// unsaved guest line"));
+    g.type("src/helpers.ts", 0, "// after rename\n");
+    await until("editing carries on", () => hostDoc("src/helpers.ts")?.getText().startsWith("// after rename\n// unsaved guest line"));
+    await new Promise((r) => setTimeout(r, 500));
+    const renameMsgs = g.msgs.slice(before).filter((m) => m.t === "fsChanged" && m.renamed?.length);
+    assert.equal(renameMsgs.length, 1, "the host must not report a guest's rename twice");
     log("rename keeps unsaved edits ok");
+
+    // The host renames a shared file itself (as from its explorer).
+    const before2 = g.msgs.length;
+    const hostRename = new vscode.WorkspaceEdit();
+    hostRename.renameFile(vscode.Uri.file(onDisk("src/helpers.ts")), vscode.Uri.file(onDisk("src/tools.ts")));
+    assert.ok(await vscode.workspace.applyEdit(hostRename));
+    await until("guest told about the host's rename", () =>
+      g.msgs.slice(before2).find((m) => m.t === "fsChanged" && JSON.stringify(m.renamed) === '[["src/helpers.ts","src/tools.ts"]]'),
+    );
+    g.docs.get("src/helpers.ts")?.b.destroy();
+    g.docs.delete("src/helpers.ts");
+    await until("guest has the host's rename", () => g.docs.get("src/tools.ts")?.text.startsWith("// after rename"));
+    g.type("src/tools.ts", 0, "// again\n");
+    await until("editing carries on after the host's rename", () => hostDoc("src/tools.ts")?.getText().startsWith("// again\n// after rename"));
+    log("host rename ok");
 
     // ---- Shared terminals.
     const s = api.session()!;
@@ -274,6 +297,16 @@ export async function run(): Promise<void> {
     await until("guest's command ran on the host", () => output(rw).includes("56"), 30_000);
     assert.ok(!output(ro).includes("49"), "guest input must not reach a read-only terminal");
     log("writable terminal ok");
+
+    // A guest with a small panel: the shell (and the host's view) shrink to fit it.
+    const rwTerm = s.terminals.get(rw)!;
+    await until("host tab reported its size", () => rwTerm.size);
+    const hostSize = rwTerm.size!;
+    g.client.send({ t: "termResize", id: rw, cols: 30, rows: 8 });
+    await until("shell fits the guest's tab", () => rwTerm.size?.cols === Math.min(30, hostSize.cols) && rwTerm.size.rows === Math.min(8, hostSize.rows));
+    g.client.send({ t: "termResize", id: rw, cols: 0, rows: 0 });
+    await until("back to the host's size when the guest closes it", () => rwTerm.size?.cols === hostSize.cols && rwTerm.size.rows === hostSize.rows);
+    log("terminal size ok");
 
     roTerm.dispose();
     await until("closing the host tab ends it for guests", () => g.msgs.find((m) => m.t === "termClosed" && m.id === ro));

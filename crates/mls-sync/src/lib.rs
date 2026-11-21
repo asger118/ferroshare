@@ -144,6 +144,18 @@ impl DocStore {
         self.docs.remove(path).is_some()
     }
 
+    /// The file moved: keep the same document (and its history) under the
+    /// new path. Replaces any document already at `to`.
+    pub fn rename(&mut self, from: &str, to: &str) -> bool {
+        match self.docs.remove(from) {
+            Some(e) => {
+                self.docs.insert(to.into(), e);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.docs.keys().map(String::as_str)
     }

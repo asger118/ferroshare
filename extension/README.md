@@ -8,8 +8,9 @@ Real-time collaborative editing for VS Code, over a relay **you** run. No accoun
 - **Guests get your IntelliSense.** Completion, hover, go-to-definition, references, rename, signature help, formatting, semantic highlighting, inlay hints and diagnostics are answered by *your* VS Code, using your extensions (clangd, C# Dev Kit, TypeScript, …). Guests don't need the toolchain installed.
 - **Sync can't drift.** Every participant holds a CRDT replica, and lost updates are repaired automatically every few seconds.
 - **Undo is per person.** Ctrl+Z undoes your own edits, never a friend's.
-- **Guests can manage files.** Create, delete, rename and move files and folders from the explorer. A rename on the host keeps the unsaved changes, and deletes go to the host's trash.
-- **Shared terminals.** The host can share a terminal that guests watch (read-only) or type in (read/write).
+- **Guests can manage files.** Create, delete, rename and move files and folders from the explorer. Deletes go to the host's trash.
+- **Renames keep your tabs.** When anyone renames or moves a file, everyone's open tabs follow it, unsaved changes included.
+- **Shared terminals.** The host can share a terminal that guests watch (read-only) or type in (read/write). It's sized to fit everyone's panel.
 - **End-to-end encrypted.** The key lives in the invite link's `#fragment` and never reaches the relay. The relay, and anything in front of it like Cloudflare, only sees ciphertext.
 - **Self-hosted.** The relay is one small Rust binary or Docker image. It keeps no state and needs one port, or none if you use a Cloudflare Tunnel.
 
@@ -58,6 +59,6 @@ Treat an invite link like a password: anyone with the whole link can join, and c
 ## Known limitations
 
 - No port forwarding, debugging or quick fixes yet.
-- A shared terminal has the host's size; full-screen programs may wrap on a guest's smaller panel.
+- A shared terminal fits the smallest panel anyone has open, so one small panel makes it small for everyone.
 - Only the first workspace folder is shared.
 - If the host's connection to the relay drops, the session ends.

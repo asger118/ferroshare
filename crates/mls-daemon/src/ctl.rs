@@ -56,7 +56,7 @@ pub enum CtlIn {
     Diagnostics { path: String, json: String },
     /// Host: result of an `FsApply` (`err: None` = done).
     FsApplied { id: u64, err: Option<String> },
-    /// Host: the host itself created, changed or removed files.
+    /// Host: the host itself created, changed, removed or renamed files.
     FsNotify {
         #[serde(default)]
         created: Vec<String>,
@@ -64,12 +64,14 @@ pub enum CtlIn {
         changed: Vec<String>,
         #[serde(default)]
         removed: Vec<String>,
+        #[serde(default)]
+        renamed: Vec<(String, String)>,
     },
     /// Host: start a shared terminal (`shell: None` = platform default).
     TermOpen { name: String, shell: Option<String>, writable: bool },
     /// Keystrokes. Guests' input only reaches writable terminals.
     TermInput { id: u32, data: String },
-    /// Host: the terminal's size changed.
+    /// The size of this editor's tab for the terminal (0×0 = tab closed).
     TermResize { id: u32, cols: u16, rows: u16 },
     /// Host: kill the terminal.
     TermClose { id: u32 },
@@ -130,9 +132,19 @@ pub enum CtlOut {
     /// Host: a guest's file change passed the sandbox; carry it out through
     /// the editor and answer with `FsApplied`.
     FsApply { id: u64, op: FsOp },
-    FsChanged { created: Vec<String>, changed: Vec<String>, removed: Vec<String> },
+    /// Files changed. For each `renamed` pair, the shared documents below
+    /// `from` now live below `to`: drop the old bindings, a `DocState` for
+    /// each new path follows.
+    FsChanged {
+        created: Vec<String>,
+        changed: Vec<String>,
+        removed: Vec<String>,
+        renamed: Vec<(String, String)>,
+    },
     TermOpened { id: u32, name: String, writable: bool },
     TermOutput { id: u32, data: B64 },
+    /// The shell's size: the smallest tab anyone has open.
+    TermSize { id: u32, cols: u16, rows: u16 },
     TermClosed { id: u32, code: Option<u32> },
     Error { message: String },
 }
@@ -207,6 +219,8 @@ mod tests {
         assert!(matches!(m, CtlIn::Fs { id: 4, op: FsOp::Rename { .. } }));
         let m: CtlIn = serde_json::from_str(r#"{"t":"fsNotify","removed":["a"]}"#).unwrap();
         assert!(matches!(m, CtlIn::FsNotify { ref removed, ref created, .. } if removed == &["a"] && created.is_empty()));
+        let m: CtlIn = serde_json::from_str(r#"{"t":"fsNotify","renamed":[["a","b"]]}"#).unwrap();
+        assert!(matches!(m, CtlIn::FsNotify { ref renamed, .. } if renamed == &[("a".to_string(), "b".to_string())]));
         let m: CtlIn = serde_json::from_str(r#"{"t":"termOpen","name":"bash","shell":null,"writable":false}"#).unwrap();
         assert!(matches!(m, CtlIn::TermOpen { writable: false, .. }));
     }

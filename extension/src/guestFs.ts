@@ -15,6 +15,8 @@ export interface FsChange {
   created: string[];
   changed: string[];
   removed: string[];
+  /** [from, to]: renamed or moved (also folders). */
+  renamed: [string, string][];
 }
 
 export interface GuestFsBackend {
@@ -26,6 +28,12 @@ export interface GuestFsBackend {
   uriFor(path: string): vscode.Uri;
   /** Files changed on the host (by anyone). */
   readonly onDidChangeFiles: vscode.Event<FsChange>;
+  /**
+   * Someone else's rename, being replayed here so my open tabs move along,
+   * that covers `path` (as its old or new location).
+   */
+  moveOf(path: string): { from: string; to: string } | undefined;
+  moveReplayed(from: string): void;
 }
 
 /** The host prefixes errors VS Code must tell apart with a code. */
@@ -88,9 +96,14 @@ export class GuestFs implements vscode.FileSystemProvider {
   async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
     const path = GuestFs.pathOf(uri);
     if (path === "") return { type: vscode.FileType.Directory, ctime: 0, mtime: 0, size: 0 };
+    const b = await this.backend();
+    // Replaying someone else's rename: VS Code checks that the source exists
+    // and the target doesn't, as it would be before the rename.
+    const m = b.moveOf(path);
+    if (m && isUnder(path, m.to)) throw vscode.FileSystemError.FileNotFound(uri);
+    if (m) return this.stat(b.uriFor(m.to + path.slice(m.from.length)));
     const cached = this.stats.get(path);
     if (cached) return cached;
-    const b = await this.backend();
     let r: any;
     try {
       r = await b.fs({ stat: path });
@@ -161,6 +174,18 @@ export class GuestFs implements vscode.FileSystemProvider {
     add(c.removed, vscode.FileChangeType.Deleted);
     add(c.created, vscode.FileChangeType.Created);
     add(c.changed, vscode.FileChangeType.Changed);
+    for (const [from, to] of c.renamed) {
+      if (b.moveOf(from)) {
+        // My tabs are being moved; rename() reports it when that happens.
+        for (const p of [from, to]) {
+          this.forget(p);
+          parents.add(parentOf(p));
+        }
+      } else {
+        add([from], vscode.FileChangeType.Deleted);
+        add([to], vscode.FileChangeType.Created);
+      }
+    }
     for (const p of parents) events.push({ type: vscode.FileChangeType.Changed, uri: b.uriFor(p) });
     if (events.length) this.emitter.fire(events);
   }
@@ -223,7 +248,11 @@ export class GuestFs implements vscode.FileSystemProvider {
   async rename(oldUri: vscode.Uri, newUri: vscode.Uri, options: { overwrite: boolean }): Promise<void> {
     const from = GuestFs.pathOf(oldUri);
     const to = GuestFs.pathOf(newUri);
-    await this.call(oldUri, { rename: { from, to, overwrite: options.overwrite } });
+    const b = await this.backend();
+    const m = b.moveOf(from);
+    // Replaying someone else's rename: it already happened on the host.
+    if (m && m.from === from && m.to === to) b.moveReplayed(from);
+    else await this.call(oldUri, { rename: { from, to, overwrite: options.overwrite } });
     this.forget(from);
     this.forget(to);
     this.emitter.fire([

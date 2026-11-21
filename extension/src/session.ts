@@ -74,6 +74,14 @@ export class Session implements vscode.Disposable, GuestFsBackend {
   private readonly filesChanged = new vscode.EventEmitter<FsChange>();
   readonly onDidChangeFiles = this.filesChanged.event;
   readonly terminals = new Map<number, SharedTerminal>();
+  /** Guest: renames I asked for (`from\nto`). Renames by others move my open tabs. */
+  private readonly ownRenames = new Set<string>();
+  /** Guest: someone else's rename, about to be replayed on my open tabs (from -> to). */
+  private readonly moves = new Map<string, string>();
+  /** Guest: new locations of a replay still in progress; their documents attach after it. */
+  private readonly arriving = new Set<string>();
+  /** Host: guests' renames I'm carrying out, so they aren't reported back as mine. */
+  private readonly applyingRenames = new Set<string>();
 
   static async attach(port: number, token: string, log: vscode.LogOutputChannel): Promise<Session> {
     const client = await DaemonClient.connect(port, token);
@@ -137,7 +145,7 @@ export class Session implements vscode.Disposable, GuestFsBackend {
     } else {
       const shared = (uris: readonly vscode.Uri[]) => uris.map((u) => this.pathOf(u)).filter((p): p is string => p !== null);
       const notify = (c: Partial<FsChange>) => {
-        if (c.created?.length || c.changed?.length || c.removed?.length) this.client.send({ t: "fsNotify", ...c });
+        if (c.created?.length || c.changed?.length || c.removed?.length || c.renamed?.length) this.client.send({ t: "fsNotify", ...c });
       };
       this.disposables.push(
         vscode.languages.onDidChangeDiagnostics((e) => {
@@ -149,9 +157,17 @@ export class Session implements vscode.Disposable, GuestFsBackend {
         // The host's own file operations, so guests' explorers and documents follow.
         vscode.workspace.onDidCreateFiles((e) => notify({ created: shared(e.files) })),
         vscode.workspace.onDidDeleteFiles((e) => notify({ removed: shared(e.files) })),
-        vscode.workspace.onDidRenameFiles((e) =>
-          notify({ removed: shared(e.files.map((f) => f.oldUri)), created: shared(e.files.map((f) => f.newUri)) }),
-        ),
+        vscode.workspace.onDidRenameFiles((e) => {
+          const c: FsChange = { created: [], changed: [], removed: [], renamed: [] };
+          for (const f of e.files) {
+            const [from, to] = [this.pathOf(f.oldUri), this.pathOf(f.newUri)];
+            if (from !== null && to !== null) {
+              if (!this.applyingRenames.delete(`${from}\n${to}`)) c.renamed.push([from, to]);
+            } else if (from !== null) c.removed.push(from);
+            else if (to !== null) c.created.push(to);
+          }
+          notify(c);
+        }),
       );
     }
     this.disposables.push(this.filesChanged);
@@ -258,7 +274,7 @@ export class Session implements vscode.Disposable, GuestFsBackend {
         void this.onFsApply(m.id, m.op);
         break;
       case "fsChanged":
-        this.onFilesChanged({ created: m.created, changed: m.changed, removed: m.removed });
+        this.onFilesChanged({ created: m.created, changed: m.changed, removed: m.removed, renamed: m.renamed ?? [] });
         break;
       case "termOpened":
         this.onTermOpened(m.id, m.name, m.writable);
@@ -266,6 +282,14 @@ export class Session implements vscode.Disposable, GuestFsBackend {
       case "termOutput":
         this.terminals.get(m.id)?.output(Buffer.from(m.data, "base64"));
         break;
+      case "termSize": {
+        const t = this.terminals.get(m.id);
+        if (t) {
+          t.size = { cols: m.cols, rows: m.rows };
+          this.changed.fire();
+        }
+        break;
+      }
       case "termClosed": {
         const t = this.terminals.get(m.id);
         this.terminals.delete(m.id);
@@ -294,7 +318,7 @@ export class Session implements vscode.Disposable, GuestFsBackend {
       this.pushDiagnostics(p);
     } else {
       const doc = vscode.workspace.textDocuments.find((d) => this.pathOf(d.uri) === p);
-      if (doc && !b.attached) this.attachGuestDoc(b, doc);
+      if (doc && !b.attached && !this.moving(p)) this.attachGuestDoc(b, doc);
       this.settleOpen(p, b.text());
     }
     updateContextKey();
@@ -328,7 +352,7 @@ export class Session implements vscode.Disposable, GuestFsBackend {
 
   private onOpened(doc: vscode.TextDocument): void {
     const b = this.bindingFor(doc);
-    if (!b || b.attached) return;
+    if (!b || b.attached || this.moving(b.path)) return;
     if (this.role === "Guest") this.attachGuestDoc(b, doc);
     else b.attach(editorPort(doc), false);
     updateContextKey();
@@ -396,7 +420,13 @@ export class Session implements vscode.Disposable, GuestFsBackend {
         // changes move along (and language servers can update imports).
         const edit = new vscode.WorkspaceEdit();
         edit.renameFile(this.uriFor(op.rename.from), this.uriFor(op.rename.to), { overwrite: op.rename.overwrite });
-        if (!(await vscode.workspace.applyEdit(edit))) throw new Error(`could not rename ${op.rename.from}`);
+        const key = `${op.rename.from}\n${op.rename.to}`;
+        this.applyingRenames.add(key);
+        try {
+          if (!(await vscode.workspace.applyEdit(edit))) throw new Error(`could not rename ${op.rename.from}`);
+        } finally {
+          setTimeout(() => this.applyingRenames.delete(key), 1000);
+        }
       } else {
         throw new Error(`unknown file operation ${JSON.stringify(op)}`);
       }
@@ -407,16 +437,70 @@ export class Session implements vscode.Disposable, GuestFsBackend {
     }
   }
 
-  /** Files went away: their shared documents are gone too (the daemon dropped them). */
+  /**
+   * Files changed. Shared documents below removed paths are gone; those below
+   * renamed paths come back under the new name (the daemon sends a
+   * `docState` for each right after this).
+   */
   private onFilesChanged(c: FsChange): void {
+    const gone = [...c.removed, ...c.renamed.map(([from]) => from)];
     for (const [p, b] of [...this.bindings]) {
-      if (!c.removed.some((r) => isUnder(p, r))) continue;
+      if (!gone.some((r) => isUnder(p, r))) continue;
       b.destroy();
       this.bindings.delete(p);
       if (this.role === "Guest") this.diagnostics?.delete(this.uriFor(p));
     }
+    if (this.role === "Guest") {
+      for (const [from, to] of c.renamed) {
+        if (this.ownRenames.delete(`${from}\n${to}`)) continue; // VS Code moved my tabs already
+        const open = vscode.workspace.textDocuments.some((d) => {
+          const p = d.isClosed ? null : this.pathOf(d.uri);
+          return p !== null && isUnder(p, from);
+        });
+        if (open) void this.followRename(from, to);
+      }
+    }
     this.filesChanged.fire(c);
     updateContextKey();
+  }
+
+  /**
+   * Guest: someone else renamed files I have open. Move my tabs (and unsaved
+   * changes) the way VS Code does for my own renames, by replaying the
+   * rename here. GuestFs recognises the replay and doesn't send it to the
+   * host again; the documents are attached once they're at the new name.
+   */
+  private async followRename(from: string, to: string): Promise<void> {
+    this.moves.set(from, to);
+    this.arriving.add(to);
+    try {
+      const edit = new vscode.WorkspaceEdit();
+      edit.renameFile(this.uriFor(from), this.uriFor(to), { overwrite: true });
+      if (!(await vscode.workspace.applyEdit(edit))) this.log.warn(`could not move tabs from ${from} to ${to}`);
+    } catch (e) {
+      this.log.warn(`could not move tabs from ${from} to ${to}: ${e}`);
+    } finally {
+      this.moves.delete(from);
+      this.arriving.delete(to);
+    }
+    for (const d of vscode.workspace.textDocuments) {
+      const p = this.pathOf(d.uri);
+      if (p !== null && isUnder(p, to) && !d.isClosed) this.onOpened(d);
+    }
+  }
+
+  private moving(p: string): boolean {
+    return [...this.arriving].some((to) => isUnder(p, to));
+  }
+
+  moveOf(p: string): { from: string; to: string } | undefined {
+    for (const [from, to] of this.moves) if (isUnder(p, from) || isUnder(p, to)) return { from, to };
+    return undefined;
+  }
+
+  /** GuestFs did the replayed rename: from now on the files are where they really are. */
+  moveReplayed(from: string): void {
+    this.moves.delete(from);
   }
 
   // --------------------------------------------------------- terminals
@@ -479,7 +563,14 @@ export class Session implements vscode.Disposable, GuestFsBackend {
   fs(op: Record<string, unknown>): Promise<any> {
     const id = this.nextId++;
     this.client.send({ t: "fs", id, op });
-    return this.waitFor(id);
+    const reply = this.waitFor(id);
+    const r = op.rename as { from: string; to: string } | undefined;
+    if (r) {
+      const key = `${r.from}\n${r.to}`;
+      this.ownRenames.add(key);
+      reply.catch(() => this.ownRenames.delete(key));
+    }
+    return reply;
   }
 
   // ------------------------------------------------- language features

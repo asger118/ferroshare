@@ -1,11 +1,12 @@
 // The "Ferroshare" panel in the Activity Bar. With no session it is empty,
 // so VS Code shows the welcome content (Host / Join buttons) from
-// package.json. In a session it shows the connection and the participants.
+// package.json. In a session it shows the connection, the participants and
+// the shared terminals.
 
 import * as vscode from "vscode";
 import type { Session } from "./session.ts";
 
-type Node = { kind: "status" } | { kind: "invite" } | { kind: "peer"; id: number };
+type Node = { kind: "status" } | { kind: "invite" } | { kind: "peer"; id: number } | { kind: "terminal"; id: number } | { kind: "shareTerminal" };
 
 export class SessionView implements vscode.TreeDataProvider<Node> {
   private readonly emitter = new vscode.EventEmitter<void>();
@@ -27,7 +28,14 @@ export class SessionView implements vscode.TreeDataProvider<Node> {
     const peers = [...s.peers.values()]
       .sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name))
       .map((p): Node => ({ kind: "peer", id: p.id }));
-    return [{ kind: "status" }, ...(s.role === "Host" ? [{ kind: "invite" } as Node] : []), ...peers];
+    const terminals = [...s.terminals.keys()].map((id): Node => ({ kind: "terminal", id }));
+    return [
+      { kind: "status" },
+      ...(s.role === "Host" ? [{ kind: "invite" } as Node] : []),
+      ...peers,
+      ...terminals,
+      ...(s.role === "Host" ? [{ kind: "shareTerminal" } as Node] : []),
+    ];
   }
 
   getTreeItem(node: Node): vscode.TreeItem {
@@ -63,6 +71,22 @@ export class SessionView implements vscode.TreeDataProvider<Node> {
           item.tooltip = where ? `${p?.name} is in ${where}. Click to jump to their cursor.` : `${p?.name} isn't in a shared file right now.`;
           item.command = { command: "mls.goToParticipant", title: "Go to participant", arguments: [node.id] };
         }
+        return item;
+      }
+      case "terminal": {
+        const t = s.terminals.get(node.id);
+        const item = new vscode.TreeItem(t?.name ?? "terminal");
+        item.description = t?.writable ? "shared terminal" : "shared terminal · read-only";
+        item.iconPath = new vscode.ThemeIcon(t?.writable ? "terminal" : "eye");
+        item.tooltip = s.role === "Host" ? "Click to show. Closing the tab stops it for everyone." : "Click to show.";
+        item.command = { command: "mls.showTerminal", title: "Show terminal", arguments: [node.id] };
+        return item;
+      }
+      case "shareTerminal": {
+        const item = new vscode.TreeItem("Share terminal…");
+        item.iconPath = new vscode.ThemeIcon("add");
+        item.tooltip = "Start a shell on this computer that guests can watch, or type in.";
+        item.command = { command: "mls.shareTerminal", title: "Share terminal" };
         return item;
       }
     }

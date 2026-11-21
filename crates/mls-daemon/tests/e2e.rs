@@ -261,3 +261,151 @@ async fn relay_cannot_read_or_inject() {
     }
     assert!(envelopes > 0, "spy should have received (encrypted) broadcasts");
 }
+
+impl Ext {
+    /// Collect `termOutput` for terminal `id` until it contains `needle`.
+    async fn expect_output(&mut self, id: u64, needle: &str) -> String {
+        let mut seen = String::new();
+        loop {
+            let m = match tokio::time::timeout(Duration::from_secs(8), self.expect("termOutput")).await {
+                Ok(m) => m,
+                Err(_) => panic!("no {needle:?} in terminal {id} output: {seen:?}"),
+            };
+            if m["id"].as_u64() == Some(id) {
+                seen.push_str(&String::from_utf8_lossy(&STANDARD.decode(m["data"].as_str().unwrap()).unwrap()));
+                if seen.contains(needle) {
+                    return seen;
+                }
+            }
+        }
+    }
+}
+
+/// Like the host's real terminal widget: answer the cursor-position query
+/// Windows' ConPTY sends before it starts the shell.
+async fn answer_cursor_query(hx: &mut Ext, id: u64) {
+    if cfg!(windows) {
+        hx.expect_output(id, "\u{1b}[6n").await;
+        hx.send(json!({"t": "termInput", "id": id, "data": "\u{1b}[1;1R"})).await;
+    }
+}
+
+/// Shell for the terminal tests, and a line that makes it print `40+n`
+/// without that number appearing in the echoed command itself.
+fn shell_and_sum(n: u32) -> (&'static str, String) {
+    if cfg!(windows) { ("cmd.exe", format!("set /a 40+{n}\r\n")) } else { ("/bin/sh", format!("echo $((40+{n}))\n")) }
+}
+
+#[tokio::test]
+async fn guest_changes_files_through_the_host_editor() {
+    let relay_url = relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.txt"), "hello\n").unwrap();
+
+    let host = start_daemon(mls::Mode::Host { relay: relay_url, root: dir.path().into() }, "host").await;
+    let mut hx = Ext::attach(host.port, &host.token).await;
+    hx.expect("hello").await;
+    let guest = start_daemon(mls::Mode::Join { invite: host.invite.clone() }, "friend").await;
+    let mut gx = Ext::attach(guest.port, &guest.token).await;
+    gx.expect("hello").await;
+
+    // The guest has src/a.txt open as a shared document.
+    gx.send(json!({"t": "open", "path": "src/a.txt"})).await;
+    hx.expect("readDoc").await;
+    hx.send(json!({"t": "docText", "path": "src/a.txt", "text": null})).await;
+    gx.expect("docState").await;
+
+    // Create a file: the host editor is asked to do it, then everyone hears about it.
+    gx.send(json!({"t": "fs", "id": 1, "op": {"write": {"path": "new.txt", "data": "aGk=", "create": true, "overwrite": false}}})).await;
+    let apply = hx.expect("fsApply").await;
+    assert_eq!(apply["op"]["write"]["path"], "new.txt");
+    assert_eq!(apply["op"]["write"]["data"], "aGk=");
+    std::fs::write(dir.path().join("new.txt"), "hi").unwrap();
+    hx.send(json!({"t": "fsApplied", "id": apply["id"], "err": null})).await;
+    let r = gx.expect("fsResult").await;
+    assert_eq!((r["id"].as_u64(), r["ok"].as_str()), (Some(1), Some("done")));
+    assert_eq!(gx.expect("fsChanged").await["created"], json!(["new.txt"]));
+    assert_eq!(hx.expect("fsChanged").await["created"], json!(["new.txt"]));
+
+    // The sandbox refuses before the host editor is ever asked.
+    gx.send(json!({"t": "fs", "id": 2, "op": {"write": {"path": ".git/hooks/pre-commit", "data": "", "create": true, "overwrite": true}}})).await;
+    assert!(gx.expect("fsResult").await["err"].as_str().unwrap().starts_with("NoPermissions:"));
+    gx.send(json!({"t": "fs", "id": 3, "op": {"delete": {"path": "../outside", "recursive": true}}})).await;
+    assert!(gx.expect("fsResult").await["err"].as_str().unwrap().starts_with("NoPermissions:"));
+
+    // The host editor can refuse too, and the guest gets the reason.
+    gx.send(json!({"t": "fs", "id": 4, "op": {"createDir": "made"}})).await;
+    let apply = hx.expect("fsApply").await;
+    assert_eq!(apply["op"]["createDir"], "made", "refused ops must not reach the host editor");
+    hx.send(json!({"t": "fsApplied", "id": apply["id"], "err": "NoPermissions: read-only disk"})).await;
+    assert_eq!(gx.expect("fsResult").await["err"], "NoPermissions: read-only disk");
+
+    // Rename the open document: it's dropped everywhere, so the new name is
+    // seeded fresh from the host editor (which moved the buffer).
+    gx.send(json!({"t": "fs", "id": 5, "op": {"rename": {"from": "src/a.txt", "to": "src/b.txt", "overwrite": false}}})).await;
+    let apply = hx.expect("fsApply").await;
+    std::fs::rename(dir.path().join("src/a.txt"), dir.path().join("src/b.txt")).unwrap();
+    hx.send(json!({"t": "fsApplied", "id": apply["id"], "err": null})).await;
+    gx.expect("fsResult").await;
+    let ch = gx.expect("fsChanged").await;
+    assert_eq!((ch["removed"].clone(), ch["created"].clone()), (json!(["src/a.txt"]), json!(["src/b.txt"])));
+    gx.send(json!({"t": "open", "path": "src/a.txt"})).await;
+    assert_eq!(gx.expect("openFailed").await["path"], "src/a.txt");
+    gx.send(json!({"t": "open", "path": "src/b.txt"})).await;
+    assert_eq!(hx.expect("readDoc").await["path"], "src/b.txt");
+
+    // Changes the host makes itself reach guests as well.
+    hx.send(json!({"t": "fsNotify", "removed": ["new.txt"]})).await;
+    assert_eq!(gx.expect("fsChanged").await["removed"], json!(["new.txt"]));
+}
+
+#[tokio::test]
+async fn host_shares_terminals() {
+    let relay_url = relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let host = start_daemon(mls::Mode::Host { relay: relay_url, root: dir.path().into() }, "host").await;
+    let mut hx = Ext::attach(host.port, &host.token).await;
+    hx.expect("hello").await;
+    let guest = start_daemon(mls::Mode::Join { invite: host.invite.clone() }, "friend").await;
+    let mut gx = Ext::attach(guest.port, &guest.token).await;
+    gx.expect("hello").await;
+    hx.expect("peerJoined").await;
+
+    // A read-only terminal: everyone sees the output, only the host types.
+    let (shell, line) = shell_and_sum(2);
+    hx.send(json!({"t": "termOpen", "name": "build", "shell": shell, "writable": false})).await;
+    let opened = hx.expect("termOpened").await;
+    let ro = opened["id"].as_u64().unwrap();
+    answer_cursor_query(&mut hx, ro).await;
+    let g = gx.expect("termOpened").await;
+    assert_eq!((g["id"].as_u64(), g["name"].as_str(), g["writable"].as_bool()), (Some(ro), Some("build"), Some(false)));
+    hx.send(json!({"t": "termInput", "id": ro, "data": line})).await;
+    gx.expect_output(ro, "42").await;
+
+    // The guest's keystrokes don't reach a read-only terminal.
+    let (_, sneaky) = shell_and_sum(9);
+    gx.send(json!({"t": "termInput", "id": ro, "data": sneaky})).await;
+
+    // A writable one: the guest can run commands on the host.
+    hx.send(json!({"t": "termOpen", "name": "shell", "shell": shell, "writable": true})).await;
+    let rw = hx.expect("termOpened").await["id"].as_u64().unwrap();
+    answer_cursor_query(&mut hx, rw).await;
+    assert_eq!(gx.expect("termOpened").await["writable"], true);
+    let (_, line) = shell_and_sum(16);
+    gx.send(json!({"t": "termInput", "id": rw, "data": line})).await;
+    gx.expect_output(rw, "56").await;
+
+    // Someone joining later gets the open terminals with their history.
+    let late = start_daemon(mls::Mode::Join { invite: host.invite.clone() }, "late").await;
+    let mut lx = Ext::attach(late.port, &late.token).await;
+    lx.expect("hello").await;
+    assert_eq!(lx.expect("termOpened").await["id"].as_u64(), Some(ro));
+    let history = lx.expect_output(ro, "42").await;
+    assert!(!history.contains("49"), "read-only terminal ran the guest's command: {history:?}");
+
+    // The host closes it: it's gone for everyone.
+    hx.send(json!({"t": "termClose", "id": ro})).await;
+    assert_eq!(gx.expect("termClosed").await["id"].as_u64(), Some(ro));
+    hx.send(json!({"t": "leave"})).await;
+}

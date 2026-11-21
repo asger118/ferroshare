@@ -4,9 +4,10 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { DocBinding, type EditorPort } from "./binding.ts";
 import { DaemonClient, type Msg } from "./daemon.ts";
-import { GuestFs, type GuestFsBackend } from "./guestFs.ts";
+import { type FsChange, GuestFs, type GuestFsBackend } from "./guestFs.ts";
 import { type LangArgs, SemanticTokensRegistry, executeOnHost, registerGuestProviders, revive, reviveDiagnostics, serialize } from "./lang.ts";
 import { Presence } from "./presence.ts";
+import { SharedTerminal } from "./terminals.ts";
 
 export type Role = "Host" | "Guest";
 export interface Peer {
@@ -16,6 +17,14 @@ export interface Peer {
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
+
+const isUnder = (p: string, prefix: string) => p === prefix || p.startsWith(prefix + "/");
+
+/** `FileExists: …` etc., so the guest's VS Code can tell errors apart. */
+function fsErrorText(e: unknown): string {
+  if (e instanceof vscode.FileSystemError && e.code) return `${e.code}: ${e.message}`;
+  return e instanceof Error ? e.message : String(e);
+}
 
 function editorPort(doc: vscode.TextDocument): EditorPort {
   return {
@@ -62,6 +71,9 @@ export class Session implements vscode.Disposable, GuestFsBackend {
   private readonly ended = new vscode.EventEmitter<string>();
   /** Fires when the session is over (reason). */
   readonly onDidEnd = this.ended.event;
+  private readonly filesChanged = new vscode.EventEmitter<FsChange>();
+  readonly onDidChangeFiles = this.filesChanged.event;
+  readonly terminals = new Map<number, SharedTerminal>();
 
   static async attach(port: number, token: string, log: vscode.LogOutputChannel): Promise<Session> {
     const client = await DaemonClient.connect(port, token);
@@ -123,6 +135,10 @@ export class Session implements vscode.Disposable, GuestFsBackend {
       // Re-attach documents that survived a window reload.
       for (const d of vscode.workspace.textDocuments) if (this.isOurs(d.uri)) void this.openText(this.pathOf(d.uri)!);
     } else {
+      const shared = (uris: readonly vscode.Uri[]) => uris.map((u) => this.pathOf(u)).filter((p): p is string => p !== null);
+      const notify = (c: Partial<FsChange>) => {
+        if (c.created?.length || c.changed?.length || c.removed?.length) this.client.send({ t: "fsNotify", ...c });
+      };
       this.disposables.push(
         vscode.languages.onDidChangeDiagnostics((e) => {
           for (const uri of e.uris) {
@@ -130,8 +146,15 @@ export class Session implements vscode.Disposable, GuestFsBackend {
             if (p && this.bindings.has(p)) this.pushDiagnostics(p);
           }
         }),
+        // The host's own file operations, so guests' explorers and documents follow.
+        vscode.workspace.onDidCreateFiles((e) => notify({ created: shared(e.files) })),
+        vscode.workspace.onDidDeleteFiles((e) => notify({ removed: shared(e.files) })),
+        vscode.workspace.onDidRenameFiles((e) =>
+          notify({ removed: shared(e.files.map((f) => f.oldUri)), created: shared(e.files.map((f) => f.newUri)) }),
+        ),
       );
     }
+    this.disposables.push(this.filesChanged);
   }
 
   // ------------------------------------------------------------ paths
@@ -231,6 +254,25 @@ export class Session implements vscode.Disposable, GuestFsBackend {
         this.diagPushes.set(m.path, (this.diagPushes.get(m.path) ?? 0) + 1);
         this.diagnostics?.set(this.uriFor(m.path), reviveDiagnostics(m.json, (p) => this.uriFor(p)));
         break;
+      case "fsApply":
+        void this.onFsApply(m.id, m.op);
+        break;
+      case "fsChanged":
+        this.onFilesChanged({ created: m.created, changed: m.changed, removed: m.removed });
+        break;
+      case "termOpened":
+        this.onTermOpened(m.id, m.name, m.writable);
+        break;
+      case "termOutput":
+        this.terminals.get(m.id)?.output(Buffer.from(m.data, "base64"));
+        break;
+      case "termClosed": {
+        const t = this.terminals.get(m.id);
+        this.terminals.delete(m.id);
+        t?.exit(m.code === null || m.code === undefined ? "terminal closed" : `process exited with code ${m.code}`);
+        this.changed.fire();
+        break;
+      }
       case "error":
         void vscode.window.showErrorMessage(`Ferroshare: ${m.message}`);
         break;
@@ -331,6 +373,87 @@ export class Session implements vscode.Disposable, GuestFsBackend {
     for (const w of waiters) result instanceof Error ? w.reject(result) : w.resolve(result);
   }
 
+  // ------------------------------------------------------ file changes
+
+  /** Host: carry out a guest's file change (already checked by the daemon's sandbox). */
+  private async onFsApply(id: number, op: any): Promise<void> {
+    try {
+      if (op.write) {
+        await vscode.workspace.fs.writeFile(this.uriFor(op.write.path), Buffer.from(op.write.data, "base64"));
+      } else if (op.createDir !== undefined) {
+        await vscode.workspace.fs.createDirectory(this.uriFor(op.createDir));
+      } else if (op.delete) {
+        const uri = this.uriFor(op.delete.path);
+        try {
+          await vscode.workspace.fs.delete(uri, { recursive: op.delete.recursive, useTrash: true });
+        } catch (e) {
+          if (e instanceof vscode.FileSystemError && e.code === "FileNotFound") throw e;
+          this.log.warn(`no trash for ${op.delete.path} (${e}); deleting permanently`);
+          await vscode.workspace.fs.delete(uri, { recursive: op.delete.recursive, useTrash: false });
+        }
+      } else if (op.rename) {
+        // Through a WorkspaceEdit, so the host's open editors and unsaved
+        // changes move along (and language servers can update imports).
+        const edit = new vscode.WorkspaceEdit();
+        edit.renameFile(this.uriFor(op.rename.from), this.uriFor(op.rename.to), { overwrite: op.rename.overwrite });
+        if (!(await vscode.workspace.applyEdit(edit))) throw new Error(`could not rename ${op.rename.from}`);
+      } else {
+        throw new Error(`unknown file operation ${JSON.stringify(op)}`);
+      }
+      this.client.send({ t: "fsApplied", id, err: null });
+    } catch (e) {
+      this.log.warn(`guest file change failed: ${fsErrorText(e)}`);
+      this.client.send({ t: "fsApplied", id, err: fsErrorText(e) });
+    }
+  }
+
+  /** Files went away: their shared documents are gone too (the daemon dropped them). */
+  private onFilesChanged(c: FsChange): void {
+    for (const [p, b] of [...this.bindings]) {
+      if (!c.removed.some((r) => isUnder(p, r))) continue;
+      b.destroy();
+      this.bindings.delete(p);
+      if (this.role === "Guest") this.diagnostics?.delete(this.uriFor(p));
+    }
+    this.filesChanged.fire(c);
+    updateContextKey();
+  }
+
+  // --------------------------------------------------------- terminals
+
+  /** Host: start sharing a new terminal. */
+  shareTerminal(writable: boolean): void {
+    const shell = vscode.env.shell || null;
+    const name = shell ? shell.split(/[\\/]/).pop()!.replace(/\.exe$/i, "") : "terminal";
+    this.client.send({ t: "termOpen", name, shell, writable });
+  }
+
+  private onTermOpened(id: number, name: string, writable: boolean): void {
+    const existing = this.terminals.get(id);
+    if (existing) {
+      existing.reset(); // the daemon replays the history next
+      return;
+    }
+    const t = new SharedTerminal(
+      id,
+      name,
+      writable,
+      this.role === "Host",
+      {
+        input: (i, data) => this.client.send({ t: "termInput", id: i, data }),
+        resize: (i, cols, rows) => this.client.send({ t: "termResize", id: i, cols, rows }),
+        close: (i) => this.client.send({ t: "termClose", id: i }),
+      },
+      this.hostName,
+    );
+    this.terminals.set(id, t);
+    t.show(this.role === "Guest");
+    if (this.role === "Guest") {
+      void vscode.window.showInformationMessage(`${this.hostName} shared a terminal${writable ? " you can type in" : " (read-only)"}.`);
+    }
+    this.changed.fire();
+  }
+
   // -------------------------------------------------- guest fs backend
 
   openText(p: string): Promise<string | null> {
@@ -353,7 +476,7 @@ export class Session implements vscode.Disposable, GuestFsBackend {
     this.client.send({ t: "save", path: p });
   }
 
-  fs(op: Record<string, string>): Promise<any> {
+  fs(op: Record<string, unknown>): Promise<any> {
     const id = this.nextId++;
     this.client.send({ t: "fs", id, op });
     return this.waitFor(id);
@@ -451,6 +574,8 @@ export class Session implements vscode.Disposable, GuestFsBackend {
     for (const t of this.diagTimers.values()) clearTimeout(t);
     for (const b of this.bindings.values()) b.destroy();
     this.bindings.clear();
+    for (const t of this.terminals.values()) t.exit("session ended");
+    this.terminals.clear();
     for (const d of this.disposables) d.dispose();
     this.client.close();
     updateContextKey();

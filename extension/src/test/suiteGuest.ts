@@ -89,5 +89,31 @@ export async function run(): Promise<void> {
   assert.ok(doc.getText().startsWith("// typed by host\n"), "host's edit survives guest undo");
   log("undo ok");
 
+  // File changes through VS Code's own file APIs (what the explorer uses).
+  const onDisk = (p: string) => path.join(ws, ...p.split("/"));
+  const newFile = vscode.Uri.joinPath(root, "src", "added.ts");
+  await vscode.workspace.fs.writeFile(newFile, Buffer.from("export const added = true;\n"));
+  assert.equal(fs.readFileSync(onDisk("src/added.ts"), "utf8"), "export const added = true;\n");
+  await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(root, "docs"));
+  assert.ok(fs.statSync(onDisk("docs")).isDirectory());
+  await vscode.workspace.fs.rename(newFile, vscode.Uri.joinPath(root, "docs", "added.ts"));
+  assert.ok(fs.existsSync(onDisk("docs/added.ts")) && !fs.existsSync(onDisk("src/added.ts")));
+  const listed = await until("explorer sees the move", async () => {
+    const e = await vscode.workspace.fs.readDirectory(vscode.Uri.joinPath(root, "docs"));
+    return e.some(([n]) => n === "added.ts") && e;
+  });
+  assert.ok(listed);
+  await assert.rejects(
+    Promise.resolve(vscode.workspace.fs.rename(vscode.Uri.joinPath(root, "docs", "added.ts"), vscode.Uri.joinPath(root, "src", "util.ts"), { overwrite: false })),
+    (e: any) => e instanceof vscode.FileSystemError && e.code === "FileExists",
+  );
+  await assert.rejects(
+    Promise.resolve(vscode.workspace.fs.writeFile(vscode.Uri.joinPath(root, ".git", "config"), Buffer.from("x"))),
+    (e: any) => e instanceof vscode.FileSystemError && e.code === "NoPermissions",
+  );
+  await vscode.workspace.fs.delete(vscode.Uri.joinPath(root, "docs"), { recursive: true });
+  assert.ok(!fs.existsSync(onDisk("docs")));
+  log("file changes ok");
+
   log("ALL GUEST CHECKS PASSED");
 }

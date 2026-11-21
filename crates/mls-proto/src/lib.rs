@@ -87,8 +87,45 @@ pub struct DirEntry {
     pub mtime: u64,
 }
 
-/// Read-only file-system operations a guest may ask the host for.
+/// Binary data: raw bytes in MessagePack, base64 in JSON (the extension's
+/// control channel), so the same types serve both.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Bytes(pub Vec<u8>);
+
+impl std::fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bytes({})", self.0.len())
+    }
+}
+
+impl Serialize for Bytes {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine;
+        if s.is_human_readable() {
+            s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+        } else {
+            s.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use base64::Engine;
+        if d.is_human_readable() {
+            let s = String::deserialize(d)?;
+            base64::engine::general_purpose::STANDARD.decode(s).map(Bytes).map_err(serde::de::Error::custom)
+        } else {
+            serde_bytes::ByteBuf::deserialize(d).map(|b| Bytes(b.into_vec()))
+        }
+    }
+}
+
+/// File-system operations a guest may ask the host for.
 /// Paths are workspace-relative with `/` separators; `""` is the root.
+///
+/// Errors that VS Code needs to tell apart start with a code:
+/// `FileNotFound:`, `FileExists:`, `NoPermissions:`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FsOp {
@@ -96,6 +133,18 @@ pub enum FsOp {
     Stat(String),
     /// Raw bytes, for files that aren't shared as text documents (images…).
     Read(String),
+    /// Create or overwrite a file that isn't open as a shared document.
+    Write { path: String, data: Bytes, create: bool, overwrite: bool },
+    CreateDir(String),
+    Delete { path: String, recursive: bool },
+    Rename { from: String, to: String, overwrite: bool },
+}
+
+impl FsOp {
+    /// Changes the workspace, so the host's editor has to carry it out.
+    pub fn is_mutation(&self) -> bool {
+        matches!(self, FsOp::Write { .. } | FsOp::CreateDir(_) | FsOp::Delete { .. } | FsOp::Rename { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +152,8 @@ pub enum FsReply {
     Dir(Vec<DirEntry>),
     Stat(DirEntry),
     Data(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// A mutation succeeded.
+    Done,
 }
 
 /// Peer-to-peer application messages.
@@ -151,6 +202,19 @@ pub enum AppMsg {
     LangResponse { id: u64, result: Result<String, String> },
     /// Host pushes diagnostics (JSON) for a document.
     Diagnostics { path: String, json: String },
+
+    /// Host: files or folders were created, changed or removed (by a guest
+    /// or on the host). Shared documents at or below a removed path are gone.
+    FsChanged { created: Vec<String>, changed: Vec<String>, removed: Vec<String> },
+
+    /// Host started sharing a terminal. `writable`: guests may type in it.
+    TermOpened { id: u32, name: String, writable: bool },
+    /// Terminal output (raw bytes from the pty).
+    TermOutput { id: u32, data: Bytes },
+    /// Guest typed into a writable terminal.
+    TermInput { id: u32, data: Bytes },
+    /// The terminal's process exited or the host closed it.
+    TermClosed { id: u32, code: Option<u32> },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -189,5 +253,18 @@ mod tests {
             result: Err("nope".into()),
         };
         assert_eq!(decode::<AppMsg>(&encode(&m).unwrap()).unwrap(), m);
+    }
+
+    #[test]
+    fn bytes_are_raw_in_msgpack_and_base64_in_json() {
+        let m = AppMsg::TermOutput { id: 1, data: Bytes(b"hi".to_vec()) };
+        let packed = encode(&m).unwrap();
+        assert!(packed.windows(2).any(|w| w == b"hi"));
+        assert_eq!(decode::<AppMsg>(&packed).unwrap(), m);
+
+        let op = FsOp::Write { path: "a".into(), data: Bytes(vec![1, 2]), create: true, overwrite: false };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(json, r#"{"write":{"path":"a","data":"AQI=","create":true,"overwrite":false}}"#);
+        assert_eq!(serde_json::from_str::<FsOp>(&json).unwrap(), op);
     }
 }

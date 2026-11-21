@@ -61,6 +61,15 @@
         "title": "Ferroshare: Go to Participant"
       },
       {
+        "command": "mls.shareTerminal",
+        "title": "Ferroshare: Share Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "mls.showTerminal",
+        "title": "Ferroshare: Show Shared Terminal"
+      },
+      {
         "command": "mls.leave",
         "title": "Ferroshare: End / Leave Session",
         "icon": "$(debug-disconnect)"
@@ -145,15 +154,28 @@
           "group": "navigation@1"
         },
         {
+          "command": "mls.shareTerminal",
+          "when": "view == mls.session && mls.isHost",
+          "group": "navigation@2"
+        },
+        {
           "command": "mls.leave",
           "when": "view == mls.session && mls.active",
-          "group": "navigation@2"
+          "group": "navigation@3"
         }
       ],
       "commandPalette": [
         {
           "command": "mls.copyInvite",
           "when": "mls.isHost"
+        },
+        {
+          "command": "mls.shareTerminal",
+          "when": "mls.isHost"
+        },
+        {
+          "command": "mls.showTerminal",
+          "when": "mls.active"
         },
         {
           "command": "mls.goToParticipant",

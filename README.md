@@ -54,7 +54,13 @@ Mac or ARM Linux users can build the daemon themselves with `cargo build --relea
 
 - **Host:** set `ferroshare.relayUrl` to your relay's address. Open your project, click **Ferroshare** in the status bar and choose **Host session**. The invite link is copied to your clipboard.
 - **Guest:** click **Ferroshare**, choose **Join session** and paste the link. A window opens with the host's project.
-- **Status bar menu:** copy the invite, jump to a participant's cursor, end or leave the session.
+- **Status bar menu:** copy the invite, share a terminal, jump to a participant's cursor, end or leave the session.
+- **Files:** guests can create, delete, rename and move files and folders from their explorer. The host's VS Code carries each change out, so the host's open editors and unsaved changes move along with a rename, and deletes go to the host's trash.
+- **Shared terminals (host only):** **Share Terminal** starts a shell on the host machine in the shared folder, and it opens for everyone. The host picks:
+  - **Read-only:** guests see the output but can't type.
+  - **Read/write:** guests can type too, so **they can run any command on the host's computer, as the host**. Only do this with people you trust.
+
+  Closing the tab on the host stops the terminal for everyone. Guests can close theirs and reopen it from the Ferroshare panel. People who join later see the recent output.
 
 ## Architecture
 
@@ -97,6 +103,10 @@ What the relay **can** still see and do:
 
 Treat the invite link like a password: anyone who has the whole link can join and see the shared folder.
 
+Guests can change files inside the shared folder (create, edit, delete, rename). The host's daemon checks every change against the same sandbox as reads: nothing outside the folder, nothing in `.git/`, and no following symlinks out. Deleted files go to the host's trash where the OS has one.
+
+Terminals are never shared unless the host chooses to. A read-only terminal ignores guests' keystrokes in the host's daemon, not just in their editor. A read/write terminal gives guests a shell on the host machine.
+
 ## Tests
 
 ```sh
@@ -110,8 +120,10 @@ npm run test:vscode                    # real VS Code: one run as host, one run 
 
 ## Known limitations
 
-- **Guests can't create, delete or rename files** yet. They can edit and save existing files. The explorer picks up the host's new and deleted files within about 5 seconds.
-- **Not built yet:** shared terminals, port forwarding, shared debugging and code actions (quick fixes).
+- **Not built yet:** port forwarding, shared debugging and code actions (quick fixes).
+- **Changes made outside VS Code** on the host (e.g. `git checkout`, a build writing files) reach guests' explorers within about 5 seconds rather than instantly.
+- **Renames by someone else:** if another participant renames a file you have open, your tab shows it as deleted. Reopen it under the new name.
+- **Terminal size:** a shared terminal has the host's size. Guests with a narrower panel see full-screen programs (`vim`, `htop`) wrapped.
 - **Duplicate results:** if a guest has their own extension for a language (TS/JS is built into VS Code), they see its results alongside the host's.
 - **Host disconnects end the session.** If the host's connection to the relay drops, the session ends. Guests reconnect automatically and nothing they typed is lost.
 - **What guests can read:** guests can read any file inside the shared folder except `.git/`. `.gitignore`d files are hidden from the explorer, but they can still be opened by exact path. Only share folders you're happy for your friends to see.

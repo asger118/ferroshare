@@ -54,6 +54,25 @@ pub enum CtlIn {
         err: Option<String>,
     },
     Diagnostics { path: String, json: String },
+    /// Host: result of an `FsApply` (`err: None` = done).
+    FsApplied { id: u64, err: Option<String> },
+    /// Host: the host itself created, changed or removed files.
+    FsNotify {
+        #[serde(default)]
+        created: Vec<String>,
+        #[serde(default)]
+        changed: Vec<String>,
+        #[serde(default)]
+        removed: Vec<String>,
+    },
+    /// Host: start a shared terminal (`shell: None` = platform default).
+    TermOpen { name: String, shell: Option<String>, writable: bool },
+    /// Keystrokes. Guests' input only reaches writable terminals.
+    TermInput { id: u32, data: String },
+    /// Host: the terminal's size changed.
+    TermResize { id: u32, cols: u16, rows: u16 },
+    /// Host: kill the terminal.
+    TermClose { id: u32 },
     Leave,
 }
 
@@ -63,6 +82,7 @@ pub enum FsOut {
     Dir(Vec<DirEntry>),
     Stat(DirEntry),
     Data(B64),
+    Done,
 }
 
 /// Daemon -> extension.
@@ -107,6 +127,13 @@ pub enum CtlOut {
         err: Option<String>,
     },
     Diagnostics { path: String, json: String },
+    /// Host: a guest's file change passed the sandbox; carry it out through
+    /// the editor and answer with `FsApplied`.
+    FsApply { id: u64, op: FsOp },
+    FsChanged { created: Vec<String>, changed: Vec<String>, removed: Vec<String> },
+    TermOpened { id: u32, name: String, writable: bool },
+    TermOutput { id: u32, data: B64 },
+    TermClosed { id: u32, code: Option<u32> },
     Error { message: String },
 }
 
@@ -176,6 +203,12 @@ mod tests {
         let m: CtlIn =
             serde_json::from_str(r#"{"t":"langResponse","to":2,"id":9,"ok":"[]","err":null}"#).unwrap();
         assert!(matches!(m, CtlIn::LangResponse { to: 2, id: 9, .. }));
+        let m: CtlIn = serde_json::from_str(r#"{"t":"fs","id":4,"op":{"rename":{"from":"a","to":"b","overwrite":false}}}"#).unwrap();
+        assert!(matches!(m, CtlIn::Fs { id: 4, op: FsOp::Rename { .. } }));
+        let m: CtlIn = serde_json::from_str(r#"{"t":"fsNotify","removed":["a"]}"#).unwrap();
+        assert!(matches!(m, CtlIn::FsNotify { ref removed, ref created, .. } if removed == &["a"] && created.is_empty()));
+        let m: CtlIn = serde_json::from_str(r#"{"t":"termOpen","name":"bash","shell":null,"writable":false}"#).unwrap();
+        assert!(matches!(m, CtlIn::TermOpen { writable: false, .. }));
     }
 
     #[test]

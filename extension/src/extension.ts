@@ -21,7 +21,7 @@ interface Saved {
 const HOST_KEY = "mls.host";
 const guestKey = (session: string) => `mls.guest.${session}`;
 
-export function activate(context: vscode.ExtensionContext): { view: SessionView } {
+export function activate(context: vscode.ExtensionContext): { view: SessionView; session: () => Session | undefined } {
   ctx = context;
   log = vscode.window.createOutputChannel("Ferroshare", { log: true });
 
@@ -61,6 +61,8 @@ export function activate(context: vscode.ExtensionContext): { view: SessionView 
   cmd("mls.copyInvite", copyInvite);
   cmd("mls.goToParticipant", goToParticipant);
   cmd("mls.leave", leave);
+  cmd("mls.shareTerminal", shareTerminal);
+  cmd("mls.showTerminal", showTerminal);
   cmd("mls.undo", () => undoRedo(false));
   cmd("mls.redo", () => undoRedo(true));
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => updateContextKey()));
@@ -84,7 +86,7 @@ export function activate(context: vscode.ExtensionContext): { view: SessionView 
     const saved = context.workspaceState.get<Saved>(HOST_KEY);
     if (saved) attachTo(saved).catch(() => context.workspaceState.update(HOST_KEY, undefined));
   }
-  return { view }; // exposed for the integration tests
+  return { view, session: () => session }; // exposed for the integration tests
 }
 
 export function deactivate(): void {
@@ -156,7 +158,13 @@ async function menu(): Promise<void> {
         { label: "$(link) Join session", description: "Paste an invite link", run: join },
       ]
     : [
-        ...(session.role === "Host" ? [{ label: "$(copy) Copy invite link", run: copyInvite }] : []),
+        ...(session.role === "Host"
+          ? [
+              { label: "$(copy) Copy invite link", run: copyInvite },
+              { label: "$(terminal) Share terminal", description: "Run a shell others can watch or use", run: shareTerminal },
+            ]
+          : []),
+        ...(session.terminals.size ? [{ label: "$(terminal) Show shared terminal", run: showTerminal }] : []),
         { label: "$(person) Go to participant", run: goToParticipant },
         { label: session.role === "Host" ? "$(debug-stop) End session" : "$(sign-out) Leave session", run: leave },
       ];
@@ -242,6 +250,41 @@ async function jumpTo(s: Session, id: number, name: string): Promise<void> {
   const doc = await vscode.workspace.openTextDocument(loc.uri);
   const pos = doc.positionAt(loc.offset);
   await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos) });
+}
+
+async function shareTerminal(): Promise<void> {
+  if (session?.role !== "Host") throw new Error("Only the host can share a terminal.");
+  const s = session;
+  const pick = await vscode.window.showQuickPick(
+    [
+      { label: "$(eye) Read-only", description: "Guests watch the output", writable: false },
+      { label: "$(terminal) Read/write", description: "Guests can type too", detail: "They can run any command on this computer, as you.", writable: true },
+    ],
+    { placeHolder: "Share a terminal" },
+  );
+  if (!pick) return;
+  if (pick.writable) {
+    const ok = await vscode.window.showWarningMessage(
+      "Guests will be able to run any command on this computer, as you. Only do this with people you trust.",
+      { modal: true },
+      "Share Read/Write",
+    );
+    if (!ok) return;
+  }
+  s.shareTerminal(pick.writable);
+}
+
+async function showTerminal(id?: number): Promise<void> {
+  if (!session) throw new Error("Not in a session.");
+  const terms = [...session.terminals.values()];
+  if (typeof id === "number") return session.terminals.get(id)?.show(false);
+  if (!terms.length) {
+    return void vscode.window.showInformationMessage(
+      session.role === "Host" ? "No shared terminals. Use Share Terminal to start one." : `${session.hostName} hasn't shared a terminal.`,
+    );
+  }
+  const pick = terms.length === 1 ? terms[0] : (await vscode.window.showQuickPick(terms.map((t) => ({ label: t.title, t })), { placeHolder: "Show terminal" }))?.t;
+  pick?.show(false);
 }
 
 async function leave(): Promise<void> {

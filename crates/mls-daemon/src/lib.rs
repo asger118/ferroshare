@@ -7,6 +7,7 @@ pub mod ctl;
 pub mod daemon;
 pub mod fs;
 pub mod relay;
+pub mod term;
 
 use std::path::PathBuf;
 
@@ -20,6 +21,10 @@ pub enum Event {
     CtlConnected(u64, mpsc::UnboundedSender<String>),
     CtlDisconnected(u64),
     Ctl(u64, ctl::CtlIn),
+    /// A shared terminal produced output (host).
+    TermOutput(u32, Vec<u8>),
+    /// A shared terminal's process exited (host).
+    TermExited(u32, Option<u32>),
 }
 
 pub enum Mode {
@@ -54,6 +59,7 @@ pub async fn run(mode: Mode, name: String, ready: impl FnOnce(&Ready)) -> anyhow
                 peers: vec![mls_proto::PeerInfo { id: h.me, name, role: Role::Host }],
                 relay: h.tx,
                 workspace: Some(workspace),
+                events: ev_tx.clone(),
             }
         }
         Mode::Join { invite } => {
@@ -68,6 +74,7 @@ pub async fn run(mode: Mode, name: String, ready: impl FnOnce(&Ready)) -> anyhow
                 peers: g.peers,
                 relay: g.tx,
                 workspace: None,
+                events: ev_tx.clone(),
             }
         }
     };

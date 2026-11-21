@@ -16,6 +16,15 @@ const ANSWERS: Record<string, unknown> = {
 const FAKE_DIAGNOSTICS = [{ range: { $range: [0, 0, 0, 6] }, message: "fake error from host", severity: 0, source: "fake" }];
 
 export class FakeHost {
+  /** Like the real host's editor, but straight to disk. */
+  private applyFs(op: any): void {
+    const p = (rel: string) => path.join(this.root, ...rel.split("/"));
+    if (op.write) fs.writeFileSync(p(op.write.path), Buffer.from(op.write.data, "base64"));
+    else if (op.createDir !== undefined) fs.mkdirSync(p(op.createDir));
+    else if (op.delete) fs.rmSync(p(op.delete.path), { recursive: op.delete.recursive });
+    else if (op.rename) fs.renameSync(p(op.rename.from), p(op.rename.to));
+  }
+
   docs = new Map<string, { b: DocBinding; text: string }>();
   saves: string[] = [];
   private client: DaemonClient;
@@ -72,6 +81,14 @@ export class FakeHost {
         }
         break;
       }
+      case "fsApply":
+        try {
+          this.applyFs(m.op);
+          this.client.send({ t: "fsApplied", id: m.id, err: null });
+        } catch (e: any) {
+          this.client.send({ t: "fsApplied", id: m.id, err: e.code === "EEXIST" ? `FileExists: ${e.message}` : String(e.message) });
+        }
+        break;
       case "langRequest": {
         // Like a real host, a diagnostics pull returns the same live state that was pushed.
         const answer = m.method === "diagnostics" ? (JSON.parse(m.args).path === "src/main.ts" ? FAKE_DIAGNOSTICS : []) : ANSWERS[m.method];

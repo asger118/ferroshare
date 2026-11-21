@@ -213,6 +213,72 @@ export async function run(): Promise<void> {
     assert.ok(String(esc.err).includes("invalid path"));
     log("sandbox ok");
 
+    // ---- Guest file changes, carried out by this (the host's) VS Code.
+    const b64 = (s: string) => Buffer.from(s).toString("base64");
+    const onDisk = (p: string) => path.join(ws, ...p.split("/"));
+    const ok = async (op: Record<string, unknown>) => {
+      const r = await g.request("fs", { op });
+      assert.equal(r.err, null, `${JSON.stringify(op)}: ${r.err}`);
+    };
+    await ok({ write: { path: "src/new.ts", data: b64("export const n = 1;\n"), create: true, overwrite: false } });
+    assert.equal(fs.readFileSync(onDisk("src/new.ts"), "utf8"), "export const n = 1;\n");
+    const exists = await g.request("fs", { op: { write: { path: "src/new.ts", data: b64("x"), create: true, overwrite: false } } });
+    assert.ok(String(exists.err).startsWith("FileExists:"), exists.err);
+    await ok({ createDir: "lib" });
+    await ok({ rename: { from: "src/new.ts", to: "lib/moved.ts", overwrite: false } });
+    assert.ok(fs.existsSync(onDisk("lib/moved.ts")) && !fs.existsSync(onDisk("src/new.ts")));
+    await ok({ delete: { path: "lib", recursive: true } });
+    assert.ok(!fs.existsSync(onDisk("lib")));
+    const git = await g.request("fs", { op: { createDir: ".git" } });
+    assert.ok(String(git.err).startsWith("NoPermissions:"), git.err);
+    log("guest create/rename/delete ok");
+
+    // Renaming a file with unsaved edits: they move to the new name on the host.
+    g.client.send({ t: "open", path: "src/util.ts" });
+    const gu = await until("guest has util.ts", () => g.docs.get("src/util.ts"));
+    g.type("src/util.ts", 0, "// unsaved guest line\n");
+    await until("host has guest's unsaved line", () =>
+      vscode.workspace.textDocuments.find((d) => d.uri.toString() === vscode.Uri.file(onDisk("src/util.ts")).toString())?.getText().startsWith("// unsaved guest line"),
+    );
+    const before = g.msgs.length;
+    await ok({ rename: { from: "src/util.ts", to: "src/helpers.ts", overwrite: false } });
+    const moved = await until("host buffer moved", () => vscode.workspace.textDocuments.find((d) => d.uri.toString() === vscode.Uri.file(onDisk("src/helpers.ts")).toString()));
+    assert.ok(moved.getText().startsWith("// unsaved guest line"), "unsaved edits follow the rename");
+    assert.ok(moved.isDirty);
+    await until("guest told util.ts is gone", () => g.msgs.slice(before).find((m) => m.t === "fsChanged" && m.removed.includes("src/util.ts")));
+    g.docs.delete("src/util.ts");
+    gu.b.destroy();
+    g.client.send({ t: "open", path: "src/helpers.ts" });
+    await until("guest reopens under the new name", () => g.docs.get("src/helpers.ts")?.text.startsWith("// unsaved guest line"));
+    log("rename keeps unsaved edits ok");
+
+    // ---- Shared terminals.
+    const s = api.session()!;
+    const shell = (vscode.env.shell || "").toLowerCase();
+    const sum = (n: number) => (/pwsh|powershell/.test(shell) ? `40+${n}\r` : /cmd(\.exe)?$/.test(shell) ? `set /a 40+${n}\r` : `echo $((40+${n}))\r`);
+    const output = (id: number) =>
+      g.msgs.filter((m) => m.t === "termOutput" && m.id === id).map((m) => Buffer.from(m.data, "base64").toString("utf8")).join("");
+
+    s.shareTerminal(false);
+    const ro = (await until("guest sees read-only terminal", () => g.msgs.find((m) => m.t === "termOpened" && !m.writable))).id;
+    const roTerm = await until("host terminal tab", () => vscode.window.terminals.find((t) => t.name.includes("read-only")));
+    roTerm.sendText(sum(2), false);
+    await until("guest sees host's command output", () => output(ro).includes("42"), 30_000);
+    g.client.send({ t: "termInput", id: ro, data: sum(9) });
+    log("read-only terminal ok");
+
+    s.shareTerminal(true);
+    const rw = (await until("guest sees writable terminal", () => g.msgs.find((m) => m.t === "termOpened" && m.writable))).id;
+    await new Promise((r) => setTimeout(r, 1500)); // let the shell start
+    g.client.send({ t: "termInput", id: rw, data: sum(16) });
+    await until("guest's command ran on the host", () => output(rw).includes("56"), 30_000);
+    assert.ok(!output(ro).includes("49"), "guest input must not reach a read-only terminal");
+    log("writable terminal ok");
+
+    roTerm.dispose();
+    await until("closing the host tab ends it for guests", () => g.msgs.find((m) => m.t === "termClosed" && m.id === ro));
+    log("terminal close ok");
+
     // ---- Host leaving ends the session for the guest.
     // (Killing the relay below also makes the detached host daemon exit.)
     g.client.send({ t: "leave" });

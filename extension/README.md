@@ -10,7 +10,7 @@ Real-time collaborative editing for VS Code, over a relay **you** run. No accoun
 - **Undo is per person.** Ctrl+Z undoes your own edits, never a friend's.
 - **Guests can manage files.** Create, delete, rename and move files and folders from the explorer. Deletes go to the host's trash.
 - **Renames keep your tabs.** When anyone renames or moves a file, everyone's open tabs follow it, unsaved changes included.
-- **Shared terminals.** The host can share a terminal that guests watch (read-only) or type in (read/write). It's sized to fit everyone's panel.
+- **Shared terminals.** The host can share a terminal that guests watch (read-only) or type in (read/write). It fits the panel of whoever typed in it last, or use Fit to My Panel.
 - **End-to-end encrypted.** The key lives in the invite link's `#fragment` and never reaches the relay. The relay, and anything in front of it like Cloudflare, only sees ciphertext.
 - **Self-hosted.** The relay is one small Rust binary or Docker image. It keeps no state and needs one port, or none if you use a Cloudflare Tunnel.
 
@@ -59,6 +59,6 @@ Treat an invite link like a password: anyone with the whole link can join, and c
 ## Known limitations
 
 - No port forwarding, debugging or quick fixes yet.
-- A shared terminal fits the smallest panel anyone has open, so one small panel makes it small for everyone.
+- A shared terminal fits one person's panel at a time; full-screen programs may wrap on a smaller one until you type or use Fit to My Panel.
 - Only the first workspace folder is shared.
 - If the host's connection to the relay drops, the session ends.

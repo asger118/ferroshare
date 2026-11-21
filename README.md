@@ -60,7 +60,7 @@ Mac or ARM Linux users can build the daemon themselves with `cargo build --relea
   - **Read-only:** guests see the output but can't type.
   - **Read/write:** guests can type too, so **they can run any command on the host's computer, as the host**. Only do this with people you trust.
 
-  The shell is sized to fit the smallest terminal panel anyone has open, so output never wraps for anyone. People with bigger panels see some empty space. Closing the tab on the host stops the terminal for everyone. Guests can close theirs and reopen it from the Ferroshare panel. People who join later see the recent output.
+  The shell is sized to fit the panel of whoever typed in it last, so the person at the keyboard always sees it right. To size it for your panel without typing, use **Fit to My Panel** next to the terminal in the Ferroshare panel. When that person closes their tab or leaves, it goes back to the host's size. Closing the tab on the host stops the terminal for everyone. Guests can close theirs and reopen it from the Ferroshare panel. People who join later see the recent output.
 
 ## Architecture
 
@@ -122,7 +122,7 @@ npm run test:vscode                    # real VS Code: one run as host, one run 
 
 - **Not built yet:** port forwarding, shared debugging and code actions (quick fixes).
 - **Changes made outside VS Code** on the host (e.g. `git checkout`, a build writing files) reach guests' explorers within about 5 seconds rather than instantly.
-- **Terminal size:** one person with a small terminal panel makes the shared shell small for everyone, until they make it bigger or close their tab.
+- **Terminal size:** a shared shell fits one person's panel at a time. If your panel is smaller than theirs, full-screen programs (`vim`, `htop`) wrap for you until you type or use Fit to My Panel.
 - **Duplicate results:** if a guest has their own extension for a language (TS/JS is built into VS Code), they see its results alongside the host's.
 - **Host disconnects end the session.** If the host's connection to the relay drops, the session ends. Guests reconnect automatically and nothing they typed is lost.
 - **What guests can read:** guests can read any file inside the shared folder except `.git/`. `.gitignore`d files are hidden from the explorer, but they can still be opened by exact path. Only share folders you're happy for your friends to see.

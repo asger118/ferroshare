@@ -286,6 +286,7 @@ export class Session implements vscode.Disposable, GuestFsBackend {
         const t = this.terminals.get(m.id);
         if (t) {
           t.size = { cols: m.cols, rows: m.rows };
+          t.sizedFor = m.by;
           this.changed.fire();
         }
         break;
@@ -526,6 +527,7 @@ export class Session implements vscode.Disposable, GuestFsBackend {
       {
         input: (i, data) => this.client.send({ t: "termInput", id: i, data }),
         resize: (i, cols, rows) => this.client.send({ t: "termResize", id: i, cols, rows }),
+        fit: (i) => this.client.send({ t: "termFit", id: i }),
         close: (i) => this.client.send({ t: "termClose", id: i }),
       },
       this.hostName,

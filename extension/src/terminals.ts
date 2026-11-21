@@ -13,8 +13,10 @@ const CURSOR_REPORT = /\x1b\[\d+;\d+R/g;
 
 export interface TerminalPort {
   input(id: number, data: string): void;
-  /** My tab's size (0×0: I closed it). The shell follows the smallest tab. */
+  /** My tab's size (0×0: I closed it). */
   resize(id: number, cols: number, rows: number): void;
+  /** Size the shell to fit my tab (typing in it does that too). */
+  fit(id: number): void;
   /** Host: kill the shell. */
   close(id: number): void;
 }
@@ -29,8 +31,9 @@ export class SharedTerminal implements vscode.Pseudoterminal {
   private terminal: vscode.Terminal | undefined;
   private warnedReadOnly = false;
   private exited = false;
-  /** The shell's size: the smallest tab anyone has open. */
+  /** The shell's size, and whose tab it fits: whoever typed in it last. */
   size: { cols: number; rows: number } | undefined;
+  sizedFor: number | undefined;
   readonly id: number;
   readonly name: string;
   readonly writable: boolean;
@@ -102,6 +105,18 @@ export class SharedTerminal implements vscode.Pseudoterminal {
       }
     }
     this.port.input(this.id, data);
+  }
+
+  /** Size the shell to fit my tab, and show it. */
+  fit(): void {
+    if (this.exited) return;
+    this.show(false);
+    this.port.fit(this.id);
+  }
+
+  /** Whether `t` is this terminal's tab. */
+  owns(t: vscode.Terminal | undefined): boolean {
+    return !!t && t === this.terminal;
   }
 
   setDimensions(dims: vscode.TerminalDimensions): void {

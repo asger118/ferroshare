@@ -224,11 +224,14 @@ pub enum AppMsg {
     TermInput { id: u32, data: Bytes },
     /// The terminal's process exited or the host closed it.
     TermClosed { id: u32, code: Option<u32> },
-    /// Guest: the size of my tab for terminal `id` (0×0 = I closed it). The
-    /// host sizes the shell to the smallest open tab, so nobody's view wraps.
+    /// Guest: the size of my tab for terminal `id` (0×0 = I closed it).
+    /// The shell is sized to fit one person's tab: whoever typed in it last,
+    /// or asked for it with `TermFit`. The host's tab is the fallback.
     TermResize { id: u32, cols: u16, rows: u16 },
-    /// Host: the shell's current size.
-    TermSize { id: u32, cols: u16, rows: u16 },
+    /// Guest: size the shell to fit my tab.
+    TermFit { id: u32 },
+    /// Host: the shell's current size, and whose tab it fits.
+    TermSize { id: u32, cols: u16, rows: u16, by: PeerId },
 }
 
 #[derive(Debug, thiserror::Error)]

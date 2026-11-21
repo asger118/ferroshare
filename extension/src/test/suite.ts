@@ -298,14 +298,21 @@ export async function run(): Promise<void> {
     assert.ok(!output(ro).includes("49"), "guest input must not reach a read-only terminal");
     log("writable terminal ok");
 
-    // A guest with a small panel: the shell (and the host's view) shrink to fit it.
+    // The shell fits the tab of whoever typed last (the guest, above).
     const rwTerm = s.terminals.get(rw)!;
-    await until("host tab reported its size", () => rwTerm.size);
-    const hostSize = rwTerm.size!;
+    const gme: number = g.msgs.find((m) => m.t === "hello")!.me;
+    const sized = (cols: number, rows: number, by: number) => rwTerm.size?.cols === cols && rwTerm.size.rows === rows && rwTerm.sizedFor === by;
     g.client.send({ t: "termResize", id: rw, cols: 30, rows: 8 });
-    await until("shell fits the guest's tab", () => rwTerm.size?.cols === Math.min(30, hostSize.cols) && rwTerm.size.rows === Math.min(8, hostSize.rows));
+    await until("shell fits the typing guest's tab", () => sized(30, 8, gme));
+    // The host takes it back with Fit to My Panel...
+    await vscode.commands.executeCommand("mls.fitTerminal", rw);
+    await until("shell fits the host's tab", () => rwTerm.sizedFor === s.me && rwTerm.size && rwTerm.size.cols !== 30);
+    const hostSize = rwTerm.size!;
+    // ...the guest asks for it again, then closes their tab.
+    g.client.send({ t: "termFit", id: rw });
+    await until("guest's fit", () => sized(30, 8, gme));
     g.client.send({ t: "termResize", id: rw, cols: 0, rows: 0 });
-    await until("back to the host's size when the guest closes it", () => rwTerm.size?.cols === hostSize.cols && rwTerm.size.rows === hostSize.rows);
+    await until("back to the host's size when the guest closes it", () => sized(hostSize.cols, hostSize.rows, s.me));
     log("terminal size ok");
 
     roTerm.dispose();

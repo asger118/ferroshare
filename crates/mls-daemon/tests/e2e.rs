@@ -385,10 +385,10 @@ async fn host_shares_terminals() {
     let dir = tempfile::tempdir().unwrap();
     let host = start_daemon(mls::Mode::Host { relay: relay_url, root: dir.path().into() }, "host").await;
     let mut hx = Ext::attach(host.port, &host.token).await;
-    hx.expect("hello").await;
+    let hme = hx.expect("hello").await["me"].as_u64().unwrap();
     let guest = start_daemon(mls::Mode::Join { invite: host.invite.clone() }, "friend").await;
     let mut gx = Ext::attach(guest.port, &guest.token).await;
-    gx.expect("hello").await;
+    let gme = gx.expect("hello").await["me"].as_u64().unwrap();
     hx.expect("peerJoined").await;
 
     // A read-only terminal: everyone sees the output, only the host types.
@@ -415,25 +415,36 @@ async fn host_shares_terminals() {
     gx.send(json!({"t": "termInput", "id": rw, "data": line})).await;
     gx.expect_output(rw, "56").await;
 
-    // The shell is sized to the smallest open tab, so nobody's view wraps...
+    // The shell fits the tab of whoever typed last: the host, here...
+    hx.send(json!({"t": "termInput", "id": rw, "data": "\r"})).await;
+    let size = |s: serde_json::Value| (s["cols"].as_u64().unwrap(), s["rows"].as_u64().unwrap(), s["by"].as_u64().unwrap());
     hx.send(json!({"t": "termResize", "id": rw, "cols": 120, "rows": 40})).await;
     let s = gx.expect("termSize").await;
-    assert_eq!((s["id"].as_u64(), s["cols"].as_u64(), s["rows"].as_u64()), (Some(rw), Some(120), Some(40)));
-    assert_eq!(hx.expect("termSize").await["cols"].as_u64(), Some(120));
+    assert_eq!(s["id"].as_u64(), Some(rw));
+    assert_eq!(size(s), (120, 40, hme));
+    assert_eq!(size(hx.expect("termSize").await), (120, 40, hme));
+    // ...a guest's tab doesn't change it until they ask for it (or type)...
     gx.send(json!({"t": "termResize", "id": rw, "cols": 70, "rows": 50})).await;
-    let s = hx.expect("termSize").await;
-    assert_eq!((s["cols"].as_u64(), s["rows"].as_u64()), (Some(70), Some(40)));
+    gx.send(json!({"t": "termFit", "id": rw})).await;
+    assert_eq!(size(hx.expect("termSize").await), (70, 50, gme));
+    assert_eq!(size(gx.expect("termSize").await), (70, 50, gme));
     let probe = if cfg!(windows) { "mode con\r\n" } else { "stty size\n" };
     gx.send(json!({"t": "termInput", "id": rw, "data": probe})).await;
-    gx.expect_output(rw, if cfg!(windows) { "70" } else { "40 70" }).await;
-    // ...and grows back when that tab closes.
+    gx.expect_output(rw, if cfg!(windows) { "70" } else { "50 70" }).await;
+    // ...the host's terminal answering the shell isn't the host typing...
+    hx.send(json!({"t": "termInput", "id": rw, "data": "\u{1b}[5;5R"})).await;
+    gx.send(json!({"t": "termResize", "id": rw, "cols": 60, "rows": 50})).await;
+    assert_eq!(size(hx.expect("termSize").await), (60, 50, gme));
+    // ...it goes back to the host's size when the guest closes their tab...
     gx.send(json!({"t": "termResize", "id": rw, "cols": 0, "rows": 0})).await;
-    let s = hx.expect("termSize").await;
-    assert_eq!((s["cols"].as_u64(), s["rows"].as_u64()), (Some(120), Some(40)));
-    // A guest can't shrink it to nothing.
+    assert_eq!(size(hx.expect("termSize").await), (120, 40, hme));
+    // ...is never made unusably small...
     gx.send(json!({"t": "termResize", "id": rw, "cols": 1, "rows": 1})).await;
-    let s = hx.expect("termSize").await;
-    assert_eq!((s["cols"].as_u64(), s["rows"].as_u64()), (Some(20), Some(5)));
+    gx.send(json!({"t": "termFit", "id": rw})).await;
+    assert_eq!(size(hx.expect("termSize").await), (20, 5, gme));
+    // ...and follows the host again once they type.
+    hx.send(json!({"t": "termInput", "id": rw, "data": "\r"})).await;
+    assert_eq!(size(hx.expect("termSize").await), (120, 40, hme));
 
     // Someone joining later gets the open terminals with their history.
     let late = start_daemon(mls::Mode::Join { invite: host.invite.clone() }, "late").await;

@@ -73,6 +73,8 @@ pub enum CtlIn {
     TermInput { id: u32, data: String },
     /// The size of this editor's tab for the terminal (0×0 = tab closed).
     TermResize { id: u32, cols: u16, rows: u16 },
+    /// Size the shell to fit this editor's tab.
+    TermFit { id: u32 },
     /// Host: kill the terminal.
     TermClose { id: u32 },
     Leave,
@@ -143,8 +145,8 @@ pub enum CtlOut {
     },
     TermOpened { id: u32, name: String, writable: bool },
     TermOutput { id: u32, data: B64 },
-    /// The shell's size: the smallest tab anyone has open.
-    TermSize { id: u32, cols: u16, rows: u16 },
+    /// The shell's size, and whose tab it fits.
+    TermSize { id: u32, cols: u16, rows: u16, by: PeerId },
     TermClosed { id: u32, code: Option<u32> },
     Error { message: String },
 }

@@ -47,26 +47,41 @@ struct Terminal {
     writable: bool,
     scrollback: Vec<u8>,
     pty: Option<Pty>,
-    /// Current size of the shell.
+    /// Current size of the shell, and whose tab it fits.
     size: (u16, u16),
-    /// Host: the size of each participant's open tab. The shell gets the
-    /// smallest, so output fits everyone's tab without wrapping.
+    by: PeerId,
+    /// Host: the size of each participant's open tab.
     views: BTreeMap<PeerId, (u16, u16)>,
+    /// Host: whose tab the shell should fit: whoever typed in it last or
+    /// asked for it. Back to the host when they close their tab or leave.
+    driver: PeerId,
     /// Guest: the size of my tab, re-sent after a reconnect.
     mine: Option<(u16, u16)>,
 }
 
 impl Terminal {
-    fn new(name: String, writable: bool, pty: Option<Pty>) -> Self {
-        Self { name, writable, scrollback: Vec::new(), pty, size: (80, 24), views: BTreeMap::new(), mine: None }
+    fn new(name: String, writable: bool, pty: Option<Pty>, host: PeerId) -> Self {
+        Self { name, writable, scrollback: Vec::new(), pty, size: (80, 24), by: host, views: BTreeMap::new(), driver: host, mine: None }
     }
 }
 
-/// The smallest tab anyone has open (`None`: nobody has one open).
-fn view_size(views: &BTreeMap<PeerId, (u16, u16)>) -> Option<(u16, u16)> {
-    let cols = views.values().map(|v| v.0).min()?;
-    let rows = views.values().map(|v| v.1).min()?;
-    Some((cols.max(MIN_COLS), rows.max(MIN_ROWS)))
+/// Input that is someone typing, not their terminal widget answering the
+/// shell: cursor position reports (`ESC[row;colR`) and focus in/out
+/// (`ESC[I`, `ESC[O`) arrive without anyone touching the keyboard.
+fn is_typing(mut s: &[u8]) -> bool {
+    while !s.is_empty() {
+        let Some(rest) = s.strip_prefix(b"\x1b[") else { return true };
+        if let Some(r) = rest.strip_prefix(b"I").or_else(|| rest.strip_prefix(b"O")) {
+            s = r;
+            continue;
+        }
+        let n = rest.iter().take_while(|c| c.is_ascii_digit() || **c == b';').count();
+        if n == 0 || rest.get(n) != Some(&b'R') {
+            return true;
+        }
+        s = &rest[n + 1..];
+    }
+    false
 }
 
 #[derive(Default)]
@@ -277,7 +292,7 @@ impl Daemon {
         }
         for (&id, t) in &self.terminals {
             self.emit(CtlOut::TermOpened { id, name: t.name.clone(), writable: t.writable });
-            self.emit(CtlOut::TermSize { id, cols: t.size.0, rows: t.size.1 });
+            self.emit(CtlOut::TermSize { id, cols: t.size.0, rows: t.size.1, by: t.by });
             if !t.scrollback.is_empty() {
                 self.emit(CtlOut::TermOutput { id, data: B64(t.scrollback.clone()) });
             }
@@ -355,8 +370,12 @@ impl Daemon {
             }
             CtlIn::TermInput { id, data } => {
                 if self.is_host() {
+                    let typing = is_typing(data.as_bytes());
                     if let Some(pty) = self.terminals.get(&id).and_then(|t| t.pty.as_ref()) {
                         pty.write(data.into_bytes());
+                    }
+                    if typing {
+                        self.set_driver(id, self.me);
                     }
                 } else if self.terminals.get(&id).is_some_and(|t| t.writable) {
                     self.to_host(&AppMsg::TermInput { id, data: Bytes(data.into_bytes()) });
@@ -368,6 +387,13 @@ impl Daemon {
                 } else if let Some(t) = self.terminals.get_mut(&id) {
                     t.mine = (cols > 0 && rows > 0).then_some((cols, rows));
                     self.to_host(&AppMsg::TermResize { id, cols, rows });
+                }
+            }
+            CtlIn::TermFit { id } => {
+                if self.is_host() {
+                    self.set_driver(id, self.me);
+                } else if self.terminals.contains_key(&id) {
+                    self.to_host(&AppMsg::TermFit { id });
                 }
             }
             CtlIn::TermClose { id } => {
@@ -517,7 +543,7 @@ impl Daemon {
             Ok(pty) => {
                 self.next_term += 1;
                 info!(id, name, writable, "terminal shared");
-                self.terminals.insert(id, Terminal::new(name.clone(), writable, Some(pty)));
+                self.terminals.insert(id, Terminal::new(name.clone(), writable, Some(pty), self.me));
                 self.emit(CtlOut::TermOpened { id, name: name.clone(), writable });
                 self.send(None, &AppMsg::TermOpened { id, name, writable });
             }
@@ -546,38 +572,57 @@ impl Daemon {
     }
 
     /// Host: someone's tab for terminal `id` changed size (0×0: they closed
-    /// it). The shell follows the smallest open tab.
+    /// it, or left).
     fn set_view(&mut self, id: u32, peer: PeerId, cols: u16, rows: u16) {
+        let host = self.me;
         let Some(t) = self.terminals.get_mut(&id) else { return };
         if cols == 0 || rows == 0 {
             t.views.remove(&peer);
+            if t.driver == peer {
+                t.driver = host;
+            }
         } else {
             t.views.insert(peer, (cols, rows));
         }
         self.apply_size(id);
     }
 
-    fn apply_size(&mut self, id: u32) {
+    /// Host: size terminal `id` to fit `peer`'s tab from now on.
+    fn set_driver(&mut self, id: u32, peer: PeerId) {
         let Some(t) = self.terminals.get_mut(&id) else { return };
-        // Nobody has it open: keep the last size rather than guess.
-        let Some(size) = view_size(&t.views) else { return };
-        if size == t.size {
+        if t.driver != peer {
+            t.driver = peer;
+            self.apply_size(id);
+        }
+    }
+
+    fn apply_size(&mut self, id: u32) {
+        let host = self.me;
+        let Some(t) = self.terminals.get_mut(&id) else { return };
+        let by = if t.views.contains_key(&t.driver) { t.driver } else { host };
+        // Nobody to fit (the host's tab isn't open yet): keep the last size.
+        let Some(&(cols, rows)) = t.views.get(&by) else { return };
+        let size = (cols.max(MIN_COLS), rows.max(MIN_ROWS));
+        if (size, by) == (t.size, t.by) {
             return;
         }
-        t.size = size;
-        if let Some(pty) = &t.pty {
+        if size != t.size
+            && let Some(pty) = &t.pty
+        {
             pty.resize(size.0, size.1);
         }
-        debug!(id, cols = size.0, rows = size.1, "terminal resized");
-        self.emit(CtlOut::TermSize { id, cols: size.0, rows: size.1 });
-        self.send(None, &AppMsg::TermSize { id, cols: size.0, rows: size.1 });
+        t.size = size;
+        t.by = by;
+        debug!(id, cols = size.0, rows = size.1, by, "terminal resized");
+        self.emit(CtlOut::TermSize { id, cols: size.0, rows: size.1, by });
+        self.send(None, &AppMsg::TermSize { id, cols: size.0, rows: size.1, by });
     }
 
     /// Host: bring a newly joined guest up to date with the open terminals.
     fn replay_terminals(&self, to: PeerId) {
         for (&id, t) in &self.terminals {
             self.send(Some(to), &AppMsg::TermOpened { id, name: t.name.clone(), writable: t.writable });
-            self.send(Some(to), &AppMsg::TermSize { id, cols: t.size.0, rows: t.size.1 });
+            self.send(Some(to), &AppMsg::TermSize { id, cols: t.size.0, rows: t.size.1, by: t.by });
             if !t.scrollback.is_empty() {
                 self.send(Some(to), &AppMsg::TermOutput { id, data: Bytes(t.scrollback.clone()) });
             }
@@ -796,7 +841,7 @@ impl Daemon {
                 // Also sent again after a reconnect: start over with the
                 // replay, and tell the host my tab's size again.
                 let mine = self.terminals.get(&id).and_then(|t| t.mine);
-                let mut t = Terminal::new(name.clone(), writable, None);
+                let mut t = Terminal::new(name.clone(), writable, None, from);
                 t.mine = mine;
                 self.terminals.insert(id, t);
                 self.emit(CtlOut::TermOpened { id, name, writable });
@@ -809,16 +854,28 @@ impl Daemon {
                     self.set_view(id, from, cols, rows);
                 }
             }
-            AppMsg::TermSize { id, cols, rows } if from_host => {
+            AppMsg::TermFit { id } if host => {
+                if self.peers.contains_key(&from) {
+                    self.set_driver(id, from);
+                }
+            }
+            AppMsg::TermSize { id, cols, rows, by } if from_host => {
                 if let Some(t) = self.terminals.get_mut(&id) {
                     t.size = (cols, rows);
-                    self.emit(CtlOut::TermSize { id, cols, rows });
+                    t.by = by;
+                    self.emit(CtlOut::TermSize { id, cols, rows, by });
                 }
             }
             AppMsg::TermOutput { id, data } if from_host => self.on_term_output(id, data.0),
             AppMsg::TermClosed { id, code } if from_host => self.close_terminal(id, code),
             AppMsg::TermInput { id, data } if host => match self.terminals.get(&id) {
-                Some(Terminal { writable: true, pty: Some(pty), .. }) => pty.write(data.0),
+                Some(Terminal { writable: true, pty: Some(pty), .. }) => {
+                    let typing = is_typing(&data.0);
+                    pty.write(data.0);
+                    if typing && self.peers.contains_key(&from) {
+                        self.set_driver(id, from);
+                    }
+                }
                 Some(_) => warn!(from, id, "dropping input for a read-only terminal"),
                 None => {}
             },
@@ -856,5 +913,21 @@ impl Daemon {
             return Flow::Exit;
         }
         Flow::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_typing;
+
+    #[test]
+    fn widget_replies_are_not_typing() {
+        assert!(!is_typing(b""));
+        assert!(!is_typing(b"\x1b[12;40R"));
+        assert!(!is_typing(b"\x1b[I\x1b[3;1R\x1b[O"));
+        assert!(is_typing(b"ls\r"));
+        assert!(is_typing(b"\x1b[A")); // arrow up
+        assert!(is_typing(b"\x1b[3;1Rx"));
+        assert!(is_typing(b"\x1b"));
     }
 }

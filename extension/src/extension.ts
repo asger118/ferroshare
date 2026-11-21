@@ -63,6 +63,7 @@ export function activate(context: vscode.ExtensionContext): { view: SessionView;
   cmd("mls.leave", leave);
   cmd("mls.shareTerminal", shareTerminal);
   cmd("mls.showTerminal", showTerminal);
+  cmd("mls.fitTerminal", fitTerminal);
   cmd("mls.undo", () => undoRedo(false));
   cmd("mls.redo", () => undoRedo(true));
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => updateContextKey()));
@@ -285,6 +286,22 @@ async function showTerminal(id?: number): Promise<void> {
   }
   const pick = terms.length === 1 ? terms[0] : (await vscode.window.showQuickPick(terms.map((t) => ({ label: t.title, t })), { placeHolder: "Show terminal" }))?.t;
   pick?.show(false);
+}
+
+/** Size a shared terminal to fit my panel: the one clicked in the Session view, the active one, or a pick. */
+async function fitTerminal(arg?: number | { id: number }): Promise<void> {
+  if (!session) throw new Error("Not in a session.");
+  const terms = [...session.terminals.values()];
+  const id = typeof arg === "number" ? arg : arg?.id;
+  const pick =
+    (id !== undefined ? session.terminals.get(id) : undefined) ??
+    terms.find((t) => t.owns(vscode.window.activeTerminal)) ??
+    (terms.length === 1 ? terms[0] : (await vscode.window.showQuickPick(terms.map((t) => ({ label: t.title, t })), { placeHolder: "Fit which terminal to your panel?" }))?.t);
+  if (!pick) {
+    if (!terms.length) void vscode.window.showInformationMessage("There are no shared terminals.");
+    return;
+  }
+  pick.fit();
 }
 
 async function leave(): Promise<void> {
